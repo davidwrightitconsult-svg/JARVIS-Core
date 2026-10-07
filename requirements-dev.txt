@@ -1,2 +1,2 @@
--r friday/requirements.txt
+-r jarvis/requirements.txt
 pytest==8.4.2
