@@ -58,6 +58,7 @@ from .db import (
 )
 from .polymarket import PolyMarketClient
 from .voice import synthesize
+from .routers.version import router as version_router
 
 from jarvis.core.commands import CommandRouter, CommandType
 from jarvis.core.events import Event
@@ -351,6 +352,8 @@ app.mount(
     ),
     name="static",
 )
+
+app.include_router(version_router)
 
 
 # ------------------------------------------------------------------ core
