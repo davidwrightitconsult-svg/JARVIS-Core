@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FRIDAY — trading research platform</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <svg class="mark" viewBox="0 0 48 48" aria-hidden="true">
+      <polygon points="24,3 43,14 43,34 24,45 5,34 5,14" /><polygon class="in" points="24,12 35,18.5 35,29.5 24,36 13,29.5 13,18.5" />
+      <circle cx="24" cy="24" r="3.2" />
+    </svg>
+    <div><h1>F.R.I.D.A.Y.</h1><p>Trading research platform</p></div>
+  </div>
+  <p class="mission">Compound capital. Protect the account. Execute with precision.</p>
+  <div class="clock"><span id="date"></span><strong id="time"></strong></div>
+  <div class="state" id="system"><i></i><span>Connecting</span></div>
+</header>
+
+<main class="deck">
+  <section class="col left">
+    <article class="panel brief">
+      <h2>Briefing</h2>
+      <p class="greet" id="greet">Reading FRIDAY's state.</p>
+      <ul class="facts" id="facts"></ul>
+      <p class="fine">This screen is read-only. Typed commands are on the <a href="/console">command console</a>; voice arrives in Phase 15.</p>
+    </article>
+
+    <article class="panel">
+      <h2>Portfolio <span class="tag paper">Paper</span><span class="tag locked" title="Live trading is locked until the Phase 17 audit and the owner's decision">Live locked</span></h2>
+      <dl class="ledger" id="ledger"></dl>
+    </article>
+
+    <article class="panel">
+      <h2>Risk governor</h2>
+      <dl class="ledger" id="risk"></dl>
+    </article>
+  </section>
+
+  <section class="col centre">
+    <article class="panel board">
+      <h2>Validation board <span class="sub" id="board-sub"></span></h2>
+      <div class="ringwrap">
+        <svg id="ring" viewBox="-340 -178 680 356" role="img" aria-label="Every strategy and its tested status"></svg>
+      </div>
+      <ul class="legend">
+        <li class="approved">Approved for paper</li><li class="forward">Forward test</li>
+        <li class="rejected">Not approved</li><li class="pending">Registered, not yet tested</li>
+      </ul>
+    </article>
+
+    <article class="panel">
+      <h2>Strategy library <span class="sub" id="lib-sub"></span></h2>
+      <div class="tiles" id="strategies"></div>
+    </article>
+
+    <article class="panel">
+      <h2>Books and research <span class="sub" id="books-sub"></span></h2>
+      <div class="books" id="books"></div>
+    </article>
+  </section>
+
+  <section class="col right">
+    <article class="panel">
+      <h2>Market scanner <span class="sub" id="scan-sub"></span></h2>
+      <div class="tablewrap"><table id="scanner"><thead><tr><th>Market</th><th>Price</th><th>24h</th><th>Volume</th><th>Status</th></tr></thead><tbody></tbody></table></div>
+    </article>
+
+    <article class="panel">
+      <h2>Open trades <span class="sub" id="trades-sub"></span></h2>
+      <div id="trades"></div>
+    </article>
+
+    <article class="panel">
+      <h2>Recent activity</h2>
+      <div class="tablewrap"><table id="activity"><thead><tr><th>Time</th><th>Type</th><th>What</th><th>Result</th></tr></thead><tbody></tbody></table></div>
+    </article>
+
+    <article class="panel">
+      <h2>Profit and loss <span class="sub">paper, by day</span></h2>
+      <svg id="pnl" viewBox="0 0 400 110" preserveAspectRatio="none" role="img" aria-label="Paper equity by day"></svg>
+      <dl class="trio" id="pnl-stats"></dl>
+    </article>
+  </section>
+</main>
+
+<footer class="foot"><span id="foot"></span></footer>
+<script src="/static/dashboard.js"></script>
+</body>
+</html>
