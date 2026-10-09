@@ -105,6 +105,16 @@ def init_db():
 
 
 class EventLogger:
+    """Writes events to the SQLite log AND broadcasts them to any
+    subscriber callbacks. Used by the /ws/brain WebSocket to stream
+    live events to the frontend.
+
+    Subscribers are stored at the CLASS level so that any EventLogger()
+    instance shares them — EventLogger is stateless, so this is safe.
+    """
+
+    _subscribers: list = []
+
     def emit(self, event):
         payload = event.normalized()
 
@@ -130,8 +140,25 @@ class EventLogger:
                 ),
             )
 
+        # Broadcast to all subscribers. Wrap each call so a broken
+        # subscriber never breaks event logging.
+        for callback in list(self._subscribers):
+            try:
+                callback(payload)
+            except Exception:
+                pass
+
         return payload["event_id"]
 
+    @classmethod
+    def subscribe(cls, callback):
+        if callback not in cls._subscribers:
+            cls._subscribers.append(callback)
+
+    @classmethod
+    def unsubscribe(cls, callback):
+        if callback in cls._subscribers:
+            cls._subscribers.remove(callback)
 
 def log(kind, message, payload=None):
     from jarvis.core.events import Event
