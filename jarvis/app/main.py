@@ -35,6 +35,7 @@ import os
 import re
 import time
 import uuid
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -569,7 +570,7 @@ def quant_edges(market_id: str | None = None, edges_only: bool = False, limit: i
 
 
 _backtest_cache: dict = {}
-
+_gate_lock = threading.Lock()
 
 @app.get("/api/lab/backtest")
 def lab_backtest(horizon: float = 24, half_spread: float = 0.01, folds: int = 5, anchor: str = "end"):
@@ -589,7 +590,6 @@ def lab_backtest(horizon: float = 24, half_spread: float = 0.01, folds: int = 5,
     if hit and time.monotonic() - hit[0] < 600:
         return hit[1]
     result = run_backtest(quant.store, settings, frozenset(quant.rules.excluded_segments))
-    _backtest_cache.clear()
     _backtest_cache[key] = (time.monotonic(), result)
     return result
 
@@ -599,17 +599,23 @@ def lab_gate():
     """9C: the validation gate - which strategies FRIDAY may PAPER-trade. Never approves live. Cached 10 minutes."""
     if quant is None:
         raise HTTPException(status_code=503, detail=quant_status.get("reason") or "quant core disabled")
-    hit = _backtest_cache.get("gate")
+        hit = _backtest_cache.get("gate")
     if hit and time.monotonic() - hit[0] < 600:
         return hit[1]
-    from jarvis.lab import BacktestSettings, build_gate
-    settings = BacktestSettings(min_price=quant.rules.min_price, max_price=quant.rules.max_price,
-                                edge=fair_model.settings if fair_model else EdgeSettings())
-    forward = [e for e in [paper_source.gate_entry() if paper_source is not None else None] if e]
-    result = build_gate(quant.store, settings, frozenset(quant.rules.excluded_segments), forward_tests=forward)
-    _backtest_cache["gate"] = (time.monotonic(), result)
-    return result
-
+    # Only one thread runs the backtest. Concurrent callers wait and
+    # then get the cached result.
+    with _gate_lock:
+        # Re-check inside the lock — another thread may have just finished
+        hit = _backtest_cache.get("gate")
+        if hit and time.monotonic() - hit[0] < 600:
+            return hit[1]
+        from jarvis.lab import BacktestSettings, build_gate
+        settings = BacktestSettings(min_price=quant.rules.min_price, max_price=quant.rules.max_price,
+                                    edge=fair_model.settings if fair_model else EdgeSettings())
+        forward = [e for e in [paper_source.gate_entry() if paper_source is not None else None] if e]
+        result = build_gate(quant.store, settings, frozenset(quant.rules.excluded_segments), forward_tests=forward)
+        _backtest_cache["gate"] = (time.monotonic(), result)
+        return result  
 
 # ------------------------------------------------------------------ Phase 10A: Risk Governor
 

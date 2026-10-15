@@ -63,47 +63,69 @@ class _Connection:
         """Called by EventLogger.emit() from any thread."""
         self.loop.call_soon_threadsafe(self._enqueue, payload)
 
-
 async def _sender(websocket: WebSocket, conn: _Connection) -> None:
-    """Drain the queue and send events to the client."""
+    """Drain the queue and send events to the client.
+
+    Runs until cancelled. Any exception (including WebSocketDisconnect)
+    terminates the loop. The caller handles cleanup.
+    """
     while True:
         payload = await conn.queue.get()
         await websocket.send_text(json.dumps(payload))
-
+ 
 @router.websocket("/ws/brain")
 async def brain_websocket(websocket: WebSocket) -> None:
     await websocket.accept()
 
-    loop = asyncio.get_running_loop()
-    conn = _Connection(loop)
+    conn = _Connection(asyncio.get_running_loop())
 
-    # 1. Send a hello message so the client knows the connection is live.
-    await websocket.send_text(
-        json.dumps(
-            {
-                "type": "hello",
-                "service": "JARVIS",
-                "version": "0.1.0",
-                "phase": "8b",
-            }
+    # Send the hello message. If this fails, the client never truly
+    # connected — bail out immediately.
+    try:
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "hello",
+                    "service": "JARVIS",
+                    "version": "0.1.0",
+                    "phase": "8b",
+                }
+            )
         )
-    )
+    except Exception:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        return
 
-    # 2. Subscribe to the event bus.
+    # Subscribe to the event bus BEFORE we start sending.
     EventLogger.subscribe(conn.on_event)
 
-    # 3. Spawn a sender task.
     sender_task = asyncio.create_task(_sender(websocket, conn))
 
     try:
-        # 4. Read loop. We do not expect the client to send messages,
-        # but we keep the receive open so disconnects are detected.
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        pass
+        # Wait until the client disconnects or the sender dies. We use
+        # asyncio.wait() so neither task can leak — if EITHER completes,
+        # we tear down cleanly.
+        receive_task = asyncio.create_task(websocket.receive_text())
+        done, pending = await asyncio.wait(
+            {receive_task, sender_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        # Cancel whatever is still running
+        for task in pending:
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        # Drain any exception from completed tasks so nothing leaks
+        for task in done:
+            with suppress(asyncio.CancelledError, Exception):
+                task.result()
     finally:
-        sender_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await sender_task
         EventLogger.unsubscribe(conn.on_event)
+        # Ensure sender is truly stopped
+        if not sender_task.done():
+            sender_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await sender_task
