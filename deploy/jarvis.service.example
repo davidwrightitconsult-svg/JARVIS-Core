@@ -1,0 +1,17 @@
+[Unit]
+Description=JARVIS Autonomous Trading Platform
+After=network.target
+
+[Service]
+Type=simple
+User=kingdavid
+WorkingDirectory=/home/kingdavid/JARVIS-Platform/JARVIS-Core
+Environment="PATH=/home/kingdavid/JARVIS-Platform/JARVIS-Core/.venv/bin:/usr/local/bin:/usr/bin"
+Environment="JARVIS_LIBRARY_PATH=/home/kingdavid/friday/library"
+Environment="JARVIS_VAULT_PATH=/home/kingdavid/friday/FRIDAY-Knowledge-Vault"
+ExecStart=/home/kingdavid/JARVIS-Platform/JARVIS-Core/.venv/bin/python -m uvicorn jarvis.app.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
