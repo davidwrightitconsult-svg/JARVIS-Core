@@ -334,8 +334,83 @@ async def lifespan(app: FastAPI):
     state.set_component("claude", "READY" if intelligence.available else "DISABLED")
     state.set_component("polymarket", "READY")
     state.set_component("voice", "READY")
+        # === Phase 11: Autonomous Execution Layer ===
+    try:
+        from jarvis.execution import (
+            PaperBroker,
+            init_trigger,
+            init_executor,
+            init_orchestrator,
+            init_settlement,
+            get_trigger,
+            get_executor,
+        )
+        from jarvis.directives import get_sentinel, get_terminator
+        
+        paper_broker = PaperBroker()
 
+        def _governor_factory():
+            return _risk()
+        
+        def _arbiter_factory():
+            from jarvis.directives import get_arbiter
+            return get_arbiter()
+        
+        init_executor(
+            broker=paper_broker,
+            governor_factory=_governor_factory,
+            arbiter_factory=_arbiter_factory,
+            settings={"default_stake": 20.0, "mode": "PAPER"},
+        )
+
+        def _scan_fn():
+            # Delegate to the existing /api/scan logic
+            try:
+                return scan(live=False) or []
+            except Exception:
+                return []
+        
+        init_trigger(
+            scan_fn=_scan_fn,
+            event_sink=lambda ev: None,  # TODO: pipe to activity log
+            interval_seconds=60,
+        )
+        get_trigger().start_background()
+
+        init_orchestrator(
+            trigger_getter=get_trigger,
+            executor_getter=get_executor,
+            terminator_getter=get_terminator,
+            interval_seconds=60,
+        )
+        from jarvis.execution import get_orchestrator
+        get_orchestrator().start_background()
+
+        init_settlement(
+            positions_getter=lambda: [],  # TODO: wire to paper ledger
+            sell_callback=lambda mid, tid, price, stake: None,  # TODO: wire to executor
+            interval_seconds=300,
+        )
+        from jarvis.execution import get_settlement
+        get_settlement().start_background()
+
+        print("JARVIS Execution Layer: TRIGGER, EXECUTOR, ORCHESTRATOR, SETTLEMENT started.")
+    except Exception as _e:
+        print(f"JARVIS Execution Layer failed to start: {_e}")
+
+    # === End Phase 11 ===
+    
     yield
+
+        # === Phase 11: Stop autonomous agents ===
+    try:
+        from jarvis.execution import get_trigger, get_orchestrator, get_settlement
+        if get_trigger(): get_trigger().stop()
+        if get_orchestrator(): get_orchestrator().stop()
+        if get_settlement(): get_settlement().stop()
+    except Exception:
+        pass
+
 
     lifecycle.stop()
     if hermes is not None:

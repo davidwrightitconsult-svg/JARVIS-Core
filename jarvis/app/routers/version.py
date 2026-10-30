@@ -1,8 +1,4 @@
-"""JARVIS API version endpoint.
-
-Phase 8a: the smallest possible router, used to validate the router
-folder structure works with the existing app.main FastAPI instance.
-"""
+"""Version endpoint — the official identity of the platform."""
 
 from fastapi import APIRouter
 
@@ -11,13 +7,10 @@ router = APIRouter(tags=["system"])
 
 @router.get("/api/version")
 def get_version() -> dict:
-    """Return the JARVIS platform name and API version.
-
-    Used by the frontend to confirm it is talking to a JARVIS-compatible
-    backend, and by health checks to fingerprint the deployment.
-    """
+    """Return the platform name, acronym, and API version."""
     return {
-        "name": "JARVIS",
+        "name": "A.L.F.R.E.D.",
+        "acronym": "Autonomous Logic & Financial Risk Evaluation Director",
         "version": "0.1.0",
-        "phase": "8a",
+        "phase": "10",
     }
