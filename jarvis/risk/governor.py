@@ -45,6 +45,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
+from jarvis.directives import get_sentinel, get_arbiter, get_terminator
 
 RISK_VERSION = "10C.1"
 APPROVED, REDUCED, REJECTED = "APPROVED", "REDUCED", "REJECTED"
@@ -144,6 +145,38 @@ class RiskGovernor:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def evaluate(self, proposal: Proposal, portfolio: Portfolio | None = None, record: bool = True) -> dict[str, Any]:
+        # === SENTINEL / ARBITER / TERMINATOR enforcement ===
+        try:
+            from jarvis.directives import get_sentinel, get_arbiter, get_terminator
+            terminator = get_terminator()
+            if terminator.is_terminated():
+                return {
+                    "approved": False,
+                    "reason": "TERMINATED: " + (terminator.snapshot().get("reason") or "platform terminated by directive"),
+                }
+
+            sentinel = get_sentinel()
+            arbiter = get_arbiter()
+            if sentinel.is_survival_mode():
+                max_losses = sentinel.max_consecutive_losses()
+                if arbiter.should_terminate(max_losses):
+                    terminator.terminate(reason=f"Directive enforcement: {max_losses} consecutive losses")
+                    return {
+                        "approved": False,
+                        "reason": f"TERMINATED: {max_losses} consecutive losses reached",
+                    }
+                # Soft pause
+                soft_threshold = int(sentinel.get("soft_pause_after_losses", 2))
+                if arbiter.should_soft_pause(soft_threshold):
+                    return {
+                        "approved": False,
+                        "reason": f"SOFT PAUSE: {soft_threshold} consecutive losses — reducing exposure",
+                    }
+        except ImportError:
+            # Directives layer not installed; fail open (allow trading)
+            pass
+
+        # === Original risk evaluation continues below ===
         s = self.settings
         pf = portfolio or Portfolio.fresh(s.bankroll)
         checks: list[dict[str, Any]] = []

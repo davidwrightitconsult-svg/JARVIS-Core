@@ -61,6 +61,7 @@ from .polymarket import PolyMarketClient
 from .voice import synthesize
 from .routers.version import router as version_router
 from .routers.voice_tts import router as voice_tts_router
+from .routers.directives import router as directives_router
 from .routers.brain_ws import router as brain_ws_router
 
 from jarvis.core.commands import CommandRouter, CommandType
@@ -358,6 +359,7 @@ app.mount(
 
 app.include_router(version_router)
 app.include_router(voice_tts_router)
+app.include_router(directives_router)
 app.include_router(brain_ws_router)
 
 # ------------------------------------------------------------------ core
@@ -601,7 +603,7 @@ def lab_gate():
     """9C: the validation gate - which strategies FRIDAY may PAPER-trade. Never approves live. Cached 10 minutes."""
     if quant is None:
         raise HTTPException(status_code=503, detail=quant_status.get("reason") or "quant core disabled")
-        hit = _backtest_cache.get("gate")
+    hit = _backtest_cache.get("gate")
     if hit and time.monotonic() - hit[0] < 600:
         return hit[1]
     # Only one thread runs the backtest. Concurrent callers wait and
