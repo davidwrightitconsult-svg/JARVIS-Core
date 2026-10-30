@@ -67,6 +67,10 @@ CREATE TABLE IF NOT EXISTS paper_settlements(     -- 13B: every pre-resolution e
     settled_at TEXT NOT NULL, market_end TEXT NOT NULL, exit_bid REAL NOT NULL, units REAL NOT NULL,
     proceeds REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS paper_signal_orders(  -- 13C: one paper order per quant signal, ever
+    signal_id INTEGER PRIMARY KEY, at TEXT NOT NULL, strategy TEXT NOT NULL, market_id TEXT NOT NULL,
+    token_id TEXT NOT NULL, direction TEXT NOT NULL, status TEXT NOT NULL, position_id INTEGER, note TEXT
+);
 CREATE TABLE IF NOT EXISTS paper_refusals(
     id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, strategy TEXT, market_id TEXT, reason TEXT NOT NULL
 );
