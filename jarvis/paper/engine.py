@@ -99,8 +99,12 @@ class Order:
 class PaperEngine:
     def __init__(self, governor, ledger, store, settings: PaperSettings | None = None,
                  resolver: Callable[[list[str]], list[dict[str, Any]]] | None = None,
-                 clock: Callable[[], datetime] | None = None):
+                 clock: Callable[[], datetime] | None = None,
+                 live_quotes: Callable[[str], dict[str, Any] | None] | None = None):
         self.governor, self.ledger, self.store = governor, ledger, store
+        # 13A: an optional real-time quote source (token_id -> {"bid","ask","at"}). It only ever
+        # replaces a recorded quote with a FRESHER one; it never loosens a freshness or spread rule.
+        self.live_quotes = live_quotes
         self.settings = settings or PaperSettings()
         self.resolver = resolver              # asks the venue whether markets have resolved (read-only)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -123,13 +127,40 @@ class PaperEngine:
     # ------------------------------------------------------------ quotes
 
     def _quote(self, token_id: str, max_age_minutes: float) -> dict[str, Any] | None:
-        now = self.clock().isoformat(timespec="seconds")
-        q = self.store.quote_near(token_id, now, max_age_minutes / 60.0)
-        if not q:
-            return None
+        now_dt = self.clock()
+        now = now_dt.isoformat(timespec="seconds")
         ok = lambda x: isinstance(x, (int, float)) and math.isfinite(x) and 0.0 <= x <= 1.0   # noqa: E731
-        bid, ask = q.get("best_bid"), q.get("best_ask")
-        return {"bid": bid if ok(bid) else None, "ask": ask if ok(ask) else None, "at": q["observed_at"]}
+        stored = None
+        q = self.store.quote_near(token_id, now, max_age_minutes / 60.0)
+        if q:
+            bid, ask = q.get("best_bid"), q.get("best_ask")
+            stored = {"bid": bid if ok(bid) else None, "ask": ask if ok(ask) else None, "at": q["observed_at"]}
+        live = self._live_quote(token_id, now_dt, max_age_minutes, ok)
+        if live and (stored is None or live["at"] >= stored["at"]):   # a tie goes to the stream
+            return live
+        return stored
+
+    def _live_quote(self, token_id: str, now: datetime, max_age_minutes: float, ok) -> dict[str, Any] | None:
+        if self.live_quotes is None:
+            return None
+        try:
+            q = self.live_quotes(token_id)
+        except Exception:                                  # a broken feed must never break trading logic
+            return None
+        if not q or not isinstance(q.get("at"), str) or not ok(q.get("bid")) or not ok(q.get("ask")):
+            return None
+        if q["bid"] > q["ask"]:                            # crossed: the same rule the store applies
+            return None
+        if q["at"] < (now - timedelta(minutes=max_age_minutes)).isoformat(timespec="seconds"):
+            return None
+        return {"bid": q["bid"], "ask": q["ask"], "at": q["at"]}
+
+    def live_tokens(self) -> set[str]:
+        """Tokens whose price can change what this engine does right now: held positions and
+        resting orders. The real-time feed watches these first."""
+        tokens = {p["token_id"] for p in self._plans().values()}
+        tokens |= {o["token_id"] for o in self.resting("PENDING", 2000)}
+        return tokens
 
     def prices(self) -> dict[int, float]:
         """What each open position could be sold for now: the recorded bid. No bid, no entry here
