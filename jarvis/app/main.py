@@ -239,8 +239,12 @@ def _build_paper() -> None:
         return float(raw) if raw else default
     d = PaperSettings()
     try:
+        hold = os.getenv("JARVIS_PAPER_SETTLE_HOLD_ABOVE", "").strip()
         settings = PaperSettings(max_quote_age_minutes=f("JARVIS_PAPER_MAX_QUOTE_AGE_MINUTES", d.max_quote_age_minutes),
-                                 max_spread=f("JARVIS_PAPER_MAX_SPREAD", d.max_spread))
+                                 max_spread=f("JARVIS_PAPER_MAX_SPREAD", d.max_spread),
+                                 settle_before_minutes=f("JARVIS_PAPER_SETTLE_BEFORE_MINUTES", d.settle_before_minutes),
+                                 settle_hold_above=(None if hold.lower() in ("none", "off") else
+                                                    float(hold) if hold else d.settle_hold_above))
     except ValueError:
         settings = d
     paper_engine = PaperEngine(risk_governor, paper_ledger, quant.store, settings,
@@ -717,7 +721,7 @@ def paper_view(trades: int = 50):
                   "target_price": plans.get(p["position_id"], {}).get("target_price"),
                   "expires_at": plans.get(p["position_id"], {}).get("expires_at")} for p in paper_ledger.positions("OPEN")]
     return {**paper_engine.report(), "positions": open_rows, "trades": paper_engine.trades(max(1, min(int(trades), 500))),
-            "resting": paper_engine.resting("PENDING", 100),
+            "resting": paper_engine.resting("PENDING", 100), "settlement": paper_engine.settlement_report(),
             "forward_tests": [{**paper_source.standing(), "last_run": paper_source.last}] if paper_source is not None else []}
 
 

@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS paper_promotions(     -- 12C: the owner's decision to
     strategy TEXT PRIMARY KEY, promoted_at TEXT NOT NULL, promoted_by TEXT, evidence TEXT NOT NULL,
     revoked_at TEXT, revoke_reason TEXT
 );
+CREATE TABLE IF NOT EXISTS paper_settlements(     -- 13B: every pre-resolution exit, and what holding would have paid
+    position_id INTEGER PRIMARY KEY, token_id TEXT NOT NULL, market_id TEXT NOT NULL,
+    settled_at TEXT NOT NULL, market_end TEXT NOT NULL, exit_bid REAL NOT NULL, units REAL NOT NULL,
+    proceeds REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS paper_refusals(
     id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, strategy TEXT, market_id TEXT, reason TEXT NOT NULL
 );
@@ -75,12 +80,22 @@ class PaperSettings:
     min_price: float = 0.05                 # no entry in the tails
     max_price: float = 0.95
     exit_quote_age_minutes: float = 60.0    # an exit may use a quote up to this old
+    # 13B SETTLEMENT: close this many minutes before the market's end date, rather than holding into
+    # resolution, where the book thins out and the spread widens (the liquidity trap). 0 = hold.
+    settle_before_minutes: float = 30.0
+    # A position whose bid is already this high is left to resolve: selling would pay more in spread
+    # than holding could still gain. None = always exit. This is a cost rule, not a view on the outcome.
+    settle_hold_above: float | None = 0.97
 
     def __post_init__(self):
         if not (0 < self.max_quote_age_minutes <= 240 and 0 < self.exit_quote_age_minutes <= 1440):
             raise ValueError("quote ages must be positive (entry up to 240 minutes, exit up to 1440)")
         if not (0 < self.max_spread <= 0.25 and 0 <= self.min_price < self.max_price <= 1):
             raise ValueError("max_spread must be in (0, 0.25] and 0 <= min_price < max_price <= 1")
+        if not (0 <= self.settle_before_minutes <= 1440):
+            raise ValueError("settle_before_minutes must be between 0 (hold) and 1440")
+        if self.settle_hold_above is not None and not (0.5 < self.settle_hold_above <= 1):
+            raise ValueError("settle_hold_above must be in (0.5, 1] or None")
 
 
 @dataclass(frozen=True)
@@ -338,6 +353,67 @@ class PaperEngine:
                         reason, position["position_id"]))
         return closed
 
+    @staticmethod
+    def _end_dt(raw: str | None) -> datetime | None:
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    def _settlement_due(self, market_id: str, bid: float, ends: dict[str, str],
+                        now: datetime) -> bool:
+        """13B: is this position inside the pre-resolution window, and not already so far in front
+        that selling would cost more spread than holding could still gain?"""
+        if self.settings.settle_before_minutes <= 0:
+            return False
+        end = self._end_dt(ends.get(str(market_id)))
+        if end is None:
+            return False                                    # no end date recorded: the time limit still applies
+        hold = self.settings.settle_hold_above
+        if hold is not None and bid >= hold:
+            return False
+        return now >= end - timedelta(minutes=self.settings.settle_before_minutes)
+
+    def _record_settlement(self, closed: dict[str, Any], plan: dict[str, Any],
+                           ends: dict[str, str], now: datetime) -> None:
+        with self._db() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO paper_settlements(position_id, token_id, market_id, settled_at,"
+                " market_end, exit_bid, units, proceeds) VALUES(?,?,?,?,?,?,?,?)",
+                (closed["position_id"], plan["token_id"], str(closed["market_id"]),
+                 now.isoformat(timespec="seconds"), str(ends.get(str(closed["market_id"])) or ""),
+                 float(closed["exit_price"]), float(closed["units"]), float(closed["proceeds"])))
+
+    def settlement_report(self) -> dict[str, Any]:
+        """13B: did exiting before resolution help or cost? For every settled position whose market
+        has since resolved, compare what it was sold for with what holding would have paid. This is
+        measured, not assumed: if early exit is costing money, this report is where it shows."""
+        with self._db() as db:
+            rows = [dict(r) for r in db.execute("SELECT * FROM paper_settlements").fetchall()]
+        if not rows:
+            return {"settled": 0, "resolved": 0, "gain_from_exiting": None, "unresolved": 0, "detail": []}
+        resolutions = self.store.resolutions(sorted({r["market_id"] for r in rows}))
+        detail, total = [], 0.0
+        for r in rows:
+            res = resolutions.get(r["market_id"])
+            payoff = (res or {}).get("payoffs", {}).get(r["token_id"])
+            if payoff is None:
+                continue
+            held = float(payoff) * r["units"]
+            delta = round(r["proceeds"] - held, 4)          # positive: exiting early was worth it
+            total += delta
+            detail.append({"position_id": r["position_id"], "market_id": r["market_id"],
+                           "exit_bid": r["exit_bid"], "resolved_at_payoff": float(payoff),
+                           "sold_for": round(r["proceeds"], 4), "would_have_paid": round(held, 4),
+                           "gain_from_exiting": delta})
+        return {"settled": len(rows), "resolved": len(detail), "unresolved": len(rows) - len(detail),
+                "gain_from_exiting": round(total, 4) if detail else None,
+                "avg_per_settlement": round(total / len(detail), 4) if detail else None,
+                "detail": detail[-50:]}
+
     def tick(self, *_: Any) -> dict[str, Any]:
         """Look at every open paper position once and close those whose exit has come. Called after
         each stored market scan; safe to call at any time."""
@@ -346,7 +422,7 @@ class PaperEngine:
             plans = self._plans()
             open_positions = [p for p in self.ledger.positions("OPEN") if p["position_id"] in plans]
             summary = {"at": now.isoformat(timespec="seconds"), "open": len(open_positions), "closed": [],
-                       "waiting_for_a_price": 0, "errors": [], "filled": [], "expired": 0}
+                       "waiting_for_a_price": 0, "errors": [], "filled": [], "expired": 0, "settled": 0}
             try:                                               # positions filled now are looked at on the next tick
                 self._work_resting(now, summary)
             except Exception as exc:
@@ -360,6 +436,13 @@ class PaperEngine:
             except Exception as exc:
                 summary["errors"].append(f"watch: {type(exc).__name__}")
             resolved = self.store.resolutions(markets)
+            ends = {}
+            if self.settings.settle_before_minutes > 0:
+                reader = getattr(self.store, "market_end_dates", None)
+                try:                                       # a store without end dates: no settlement, no error
+                    ends = reader(markets) if reader else {}
+                except Exception as exc:
+                    summary["errors"].append(f"end dates: {type(exc).__name__}")
             for p in open_positions:
                 plan = plans[p["position_id"]]
                 q = self._quote(plan["token_id"], self.settings.exit_quote_age_minutes)
@@ -374,6 +457,10 @@ class PaperEngine:
                         done = self._close(p, q["bid"], "stop", q)
                     elif plan["target_price"] is not None and q["bid"] >= plan["target_price"] - 1e-9:
                         done = self._close(p, plan["target_price"], "target", q)
+                    elif self._settlement_due(p["market_id"], q["bid"], ends, now):
+                        done = self._close(p, q["bid"], "settlement", q)
+                        self._record_settlement(done, plan, ends, now)
+                        summary["settled"] += 1
                     elif now.isoformat(timespec="seconds") >= plan["expires_at"]:
                         done = self._close(p, q["bid"], "time", q)
                     else:

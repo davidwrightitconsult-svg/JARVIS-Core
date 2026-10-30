@@ -31,6 +31,9 @@ class TriggerSettings:
     max_tokens: int = 150
     watch_hours: float = 48.0
     min_tick_interval_s: float = 1.0
+    # 13B: time-based exits (settlement, the time limit) do not depend on a price move, so the engine
+    # is ticked on this heartbeat as well. 0 = only on price moves.
+    heartbeat_s: float = 60.0
     config: TriggerConfig = TriggerConfig()
 
     @classmethod
@@ -48,7 +51,11 @@ class TriggerSettings:
         max_tokens = num("JARVIS_TRIGGER_MAX_TOKENS", d.max_tokens)
         if not 10 <= max_tokens <= 1000:
             raise ValueError("JARVIS_TRIGGER_MAX_TOKENS must be between 10 and 1000")
+        heartbeat = num("JARVIS_TRIGGER_HEARTBEAT_S", d.heartbeat_s)
+        if heartbeat and not 5 <= heartbeat <= 900:
+            raise ValueError("JARVIS_TRIGGER_HEARTBEAT_S must be 0 (off) or between 5 and 900")
         return cls(enabled=raw in ("1", "true", "yes", "on"), max_tokens=max_tokens, config=cfg,
+                   heartbeat_s=heartbeat,
                    watch_hours=num("JARVIS_MARKET_WATCHLIST_HOURS", d.watch_hours) or d.watch_hours)
 
 
@@ -61,10 +68,12 @@ class TriggerService:
                                   priority=self._is_priority, on_quote=self.quotes.set,
                                   on_resolved=self._on_resolved, connect=connect)
         self._task: asyncio.Task | None = None
+        self._beat: asyncio.Task | None = None
         self._prio: set[str] = set()
         self._prio_at = 0.0
         self._last_tick = 0.0
         self.ticks = 0
+        self.beats = 0
         self.watch_moves = 0
         self.last_tick: dict[str, Any] | None = None
 
@@ -74,18 +83,36 @@ class TriggerService:
         if self._task is None:
             self.engine.live_quotes = self.quotes.get
             self._task = asyncio.create_task(self.agent.run(), name="jarvis.trigger")
+            if self.settings.heartbeat_s:
+                self._beat = asyncio.create_task(self._heartbeat(), name="jarvis.trigger.heartbeat")
+
+    async def _heartbeat(self) -> None:
+        """Time-based exits (13B settlement, the time limit) need no price move, so tick anyway."""
+        while True:
+            await asyncio.sleep(self.settings.heartbeat_s)
+            try:
+                self._last_tick = time.monotonic()
+                self.last_tick = await asyncio.to_thread(self.engine.tick)
+                self.ticks += 1
+                self.beats += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:                                      # noqa: BLE001
+                log.exception("heartbeat tick failed")
 
     async def stop(self) -> None:
         self.agent.stop()
-        if self._task is not None:
-            await asyncio.gather(self._task, return_exceptions=True)
-            self._task = None
+        for task in (self._beat, self._task):
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self._beat = self._task = None
         if self.engine.live_quotes == self.quotes.get:
             self.engine.live_quotes = None                         # back to recorded quotes only
 
     def status(self) -> dict[str, Any]:
         return {"enabled": True, **self.agent.snapshot(), "priority_tokens": len(self._prio),
-                "cached_quotes": len(self.quotes), "paper_ticks": self.ticks, "watch_moves": self.watch_moves,
+                "cached_quotes": len(self.quotes), "paper_ticks": self.ticks, "heartbeat_ticks": self.beats, "watch_moves": self.watch_moves,
                 "last_tick": self.last_tick, "max_tokens": self.settings.max_tokens}
 
     # --------------------------------------------------------------- universe
