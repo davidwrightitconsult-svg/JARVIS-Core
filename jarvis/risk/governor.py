@@ -132,6 +132,15 @@ class Proposal:
     detail: dict[str, Any] = field(default_factory=dict)
 
 
+def _directive_refusal(reason: str) -> dict[str, Any]:
+    """A refusal by the directive layer, in the same shape as every other decision. Callers
+    (PaperLedger.open_checked, PaperEngine) index decision["verdict"]; without it a TERMINATED
+    platform crashed them with a KeyError instead of refusing cleanly. It is not recorded: it
+    never reached the risk checks."""
+    return {"approved": False, "verdict": REJECTED, "approved_stake": 0.0, "reason": reason,
+            "checks": [], "execution_locked": True}
+
+
 def _finite(x) -> bool:
     return isinstance(x, (int, float)) and math.isfinite(x)
 
@@ -150,10 +159,8 @@ class RiskGovernor:
             from jarvis.directives import get_sentinel, get_arbiter, get_terminator
             terminator = get_terminator()
             if terminator.is_terminated():
-                return {
-                    "approved": False,
-                    "reason": "TERMINATED: " + (terminator.snapshot().get("reason") or "platform terminated by directive"),
-                }
+                return _directive_refusal(
+                    "TERMINATED: " + (terminator.snapshot().get("reason") or "platform terminated by directive"))
 
             sentinel = get_sentinel()
             arbiter = get_arbiter()
@@ -161,17 +168,12 @@ class RiskGovernor:
                 max_losses = sentinel.max_consecutive_losses()
                 if arbiter.should_terminate(max_losses):
                     terminator.terminate(reason=f"Directive enforcement: {max_losses} consecutive losses")
-                    return {
-                        "approved": False,
-                        "reason": f"TERMINATED: {max_losses} consecutive losses reached",
-                    }
+                    return _directive_refusal(f"TERMINATED: {max_losses} consecutive losses reached")
                 # Soft pause
                 soft_threshold = int(sentinel.get("soft_pause_after_losses", 2))
                 if arbiter.should_soft_pause(soft_threshold):
-                    return {
-                        "approved": False,
-                        "reason": f"SOFT PAUSE: {soft_threshold} consecutive losses — reducing exposure",
-                    }
+                    return _directive_refusal(
+                        f"SOFT PAUSE: {soft_threshold} consecutive losses — reducing exposure")
         except ImportError:
             # Directives layer not installed; fail open (allow trading)
             pass

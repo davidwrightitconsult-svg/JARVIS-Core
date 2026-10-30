@@ -11,3 +11,4 @@ PyMuPDF==1.26.4
 sqlalchemy==2.0.43
 anthropic==1.6.0
 python-multipart==0.0.20
+websockets==17.4

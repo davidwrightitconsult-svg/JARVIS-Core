@@ -569,6 +569,21 @@ class MarketStore:
             return db.execute(f"DELETE FROM watchlist WHERE market_id IN ({','.join('?' * len(ids))})",
                               ids).rowcount
 
+    def tokens_for_markets(self, market_ids: list[str]) -> dict[str, str]:
+        """13A: token_id -> market_id for the outcomes of the given markets (for the real-time feed)."""
+        ids = [str(m) for m in market_ids][:2000]
+        if not ids:
+            return {}
+        with self._db() as db:
+            rows = db.execute(f"SELECT token_id, market_id FROM outcomes WHERE market_id IN ({','.join('?' * len(ids))})",
+                              ids).fetchall()
+        return {r["token_id"]: r["market_id"] for r in rows}
+
+    def market_for_token(self, token_id: str) -> str | None:
+        with self._db() as db:
+            r = db.execute("SELECT market_id FROM outcomes WHERE token_id=?", (str(token_id),)).fetchone()
+        return r["market_id"] if r else None
+
     def watchlist(self, hours: float = 48) -> list[dict[str, Any]]:
         since = (_now() - timedelta(hours=float(hours))).isoformat(timespec="seconds")
         with self._db() as db:

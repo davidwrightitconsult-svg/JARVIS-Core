@@ -129,6 +129,8 @@ risk_governor = None            # friday.risk.RiskGovernor (Phase 10A)
 paper_ledger = None             # friday.risk.PaperLedger (Phase 10B)
 paper_engine = None             # friday.paper.PaperEngine (Phase 12A)
 paper_source = None             # friday.paper.BollingerResting (Phase 12B forward test)
+trigger_service = None          # jarvis.trigger.TriggerService (Phase 13A real-time feed; off by default)
+trigger_status: dict = {"enabled": False, "reason": "not started"}
 risk_status: dict = {"enabled": False, "reason": "not started"}
 quant_status: dict = {"enabled": False, "reason": "not started"}
 
@@ -251,6 +253,29 @@ def _build_paper() -> None:
     state.set_component("paper", "READY")
 
 
+def _build_trigger() -> None:
+    """13A: the real-time price feed. OFF unless JARVIS_TRIGGER=true. It needs the paper engine and
+    the market store; without them it stays off. It only wakes the paper engine and refreshes quotes."""
+    global trigger_service, trigger_status
+    trigger_service, trigger_status = None, {"enabled": False, "reason": "disabled (set JARVIS_TRIGGER=true)"}
+    if paper_engine is None or quant is None:
+        state.set_component("trigger", "DISABLED")
+        trigger_status = {"enabled": False, "reason": "needs the paper engine and the market store"}
+        return
+    from jarvis.trigger import TriggerService, TriggerSettings
+    error = None
+    try:
+        settings = TriggerSettings.from_environment()
+    except ValueError as exc:
+        settings, error = TriggerSettings(), str(exc)           # safe defaults (disabled), and say so
+    if not settings.enabled:
+        state.set_component("trigger", "DISABLED")
+        trigger_status = {"enabled": False, "reason": error or "disabled (set JARVIS_TRIGGER=true)"}
+        return
+    trigger_service = TriggerService(quant.store, paper_engine, settings)
+    state.set_component("trigger", "READY")
+
+
 def _build_hermes():
     global hermes, hermes_settings
     try:
@@ -324,6 +349,9 @@ async def lifespan(app: FastAPI):
     state.set_component("quant", "READY" if quant else "DISABLED")
     _build_risk()
     _build_paper()
+    _build_trigger()
+    if trigger_service is not None:
+        trigger_service.start()
     market_context = (MarketContext(store, engine=quant, fair_model=fair_model)
                       if (store is not None and context_on) else None)
     _build_hermes()
@@ -337,6 +365,8 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    if trigger_service is not None:
+        await trigger_service.stop()
     lifecycle.stop()
     if hermes is not None:
         hermes.stop()
@@ -361,6 +391,12 @@ app.include_router(version_router)
 app.include_router(voice_tts_router)
 app.include_router(directives_router)
 app.include_router(brain_ws_router)
+
+
+@app.get("/api/trigger/status")
+def trigger_state():
+    """13A: the real-time feed's health: connected, tokens watched, signals, paper ticks it caused."""
+    return trigger_service.status() if trigger_service is not None else trigger_status
 
 # ------------------------------------------------------------------ core
 
