@@ -69,6 +69,7 @@ from jarvis.core.events import Event
 from jarvis.core.health import HealthManager
 from jarvis.core.lifecycle import LifecycleManager
 from jarvis.core.state import StateManager
+from jarvis.app.auth import auth_status, require_token
 from jarvis.hermes import (
     HermesControlError,
     HermesController,
@@ -390,6 +391,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# 13D: a write needs the shared secret (JARVIS_API_TOKEN). Reads are untouched, so the dashboard
+# keeps working. There is no localhost exemption: a browser sends loopback requests from any page.
+app.middleware("http")(require_token)
+
 app.mount(
     "/static",
     __import__("fastapi.staticfiles", fromlist=["StaticFiles"]).StaticFiles(
@@ -416,6 +421,7 @@ def trigger_state():
 def health():
     result = health_manager.check()
     result["live_execution"] = False
+    result["api_auth"] = auth_status()
     result["claude"] = bool(intelligence and intelligence.available)
     result["hermes"] = hermes.state.value if hermes else "UNAVAILABLE"
     return result
