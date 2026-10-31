@@ -41,7 +41,7 @@ from dataclasses import dataclass, field as dc_field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from .costs import CostSettings, cost_of
+from .costs import CostSettings, cost_of, round_trip
 from .fills import buy_for_stake, capacity, sell_shares
 
 PAPER_VERSION = "14B.1"
@@ -91,6 +91,11 @@ class PaperSettings:
     # 14B COSTS: the taker fee folded into every booked price, so that drawdown, the scorecard and
     # the validation gate all see net-of-fee numbers without each having to know about fees.
     costs: CostSettings = dc_field(default_factory=CostSettings)
+    # 18B: refuse a market where getting in and out again costs more than this share of the capital
+    # committed. At mid prices a 2c spread plus a 0.05 fee is ~9%; a 6c spread is ~17%. An edge has
+    # to beat this before it is an edge, so a market above the limit is not worth the attempt.
+    # None turns the check off. See `jarvis.paper.costs.round_trip`.
+    max_round_trip_fraction: float | None = 0.15
     # 13B SETTLEMENT: close this many minutes before the market's end date, rather than holding into
     # resolution, where the book thins out and the spread widens (the liquidity trap). 0 = hold.
     settle_before_minutes: float = 30.0
@@ -165,6 +170,8 @@ class PaperEngine:
                 db.execute(f"ALTER TABLE paper_plans ADD COLUMN {name} REAL")
         # The books themselves, so "at what size does this edge disappear?" can be answered by
         # re-walking the real depth rather than extrapolating from a single filled size.
+        if "maker_entry" not in cols:
+            db.execute("ALTER TABLE paper_plans ADD COLUMN maker_entry REAL")
         for name in ("fee_category", "entry_book", "exit_book"):
             if name not in cols:
                 db.execute(f"ALTER TABLE paper_plans ADD COLUMN {name} TEXT")
@@ -289,6 +296,15 @@ class PaperEngine:
             if bid is None or ask - bid > s.max_spread + 1e-9:
                 return self._refuse(order, "no bid recorded" if bid is None else
                                     f"spread {ask - bid:.3f} is wider than {s.max_spread:g}")
+            category = self._fee_category(order.market_id)
+            if s.max_round_trip_fraction is not None:
+                rt = round_trip(s.costs, bid, ask, category)
+                if rt is not None and rt.fraction_of_cost > s.max_round_trip_fraction:
+                    return self._refuse(order, (
+                        f"the round trip costs {rt.total:.4f} a share, {rt.fraction_of_cost * 100:.1f}% of "
+                        f"the {rt.cost_basis:.2f} it commits (spread {rt.spread:.3f} + fees "
+                        f"{rt.entry_fee + rt.exit_fee:.4f}, {category}); the limit is "
+                        f"{s.max_round_trip_fraction * 100:.0f}%"))
             # 14A: what the book can actually absorb, and what walking it would really cost.
             asks = (q.get("levels") or {}).get("asks") if isinstance(q.get("levels"), dict) else None
             depth_on = self.settings.depth_aware and asks is not None
@@ -300,7 +316,6 @@ class PaperEngine:
 
             fills: dict[float, Any] = {}
             costs: dict[float, Any] = {}
-            category = self._fee_category(order.market_id)
 
             def price_for(approved: float) -> float | None:
                 """Price the fill against the stake the governor approved, not the one requested,
@@ -429,24 +444,58 @@ class PaperEngine:
             if fresh and q["ask"] < o["limit_price"] - 1e-9:                 # traded through: filled at our price
                 if q["bid"] is None:
                     q["bid"] = q["ask"]
+                L = o["limit_price"]
+                category = self._fee_category(o["market_id"])
+                # 18A: this is a MAKER fill. The order rested at L and someone else crossed into
+                # it, so the price is L (not the market ask, which is now better) and no taker fee
+                # is charged. Previously the maker treatment happened only because no fee was
+                # applied on this path at all, which was right by accident.
+                asks = (q.get("levels") or {}).get("asks") if isinstance(q.get("levels"), dict) else None
+                room = None
+                if self.settings.depth_aware and asks:
+                    # How much sell interest is observable at or better than our limit. A resting
+                    # order can only be filled by someone willing to sell to it, and this is the
+                    # one bound on that the snapshot can support. It is still optimistic: it
+                    # assumes every such share would have come to us.
+                    room = capacity(asks, L - asks[0][0])
+                    if room < self.settings.min_depth_usd:
+                        done(o["order_id"], "REFUSED",
+                             f"traded through {L:.3f} but only ${room:.2f} rests at or under it")
+                        continue
+                wanted = min(float(o["stake"]), room) if room is not None else float(o["stake"])
+                maker_costs: dict[float, Any] = {}
+
+                def maker_price(approved: float, _L=L, _cat=category) -> float | None:
+                    cost = cost_of(self.settings.costs, approved / _L, _L, _cat, maker=True)
+                    maker_costs[approved] = cost
+                    return max(0.0001, min(0.9999, round(_L + cost.per_share, 6)))
+
                 try:
                     decision, position = self.ledger.open_checked(
-                        self.governor, Proposal(o["strategy"], o["market_id"], o["stake"], venue="polymarket"),
-                        o["limit_price"], self.prices(), instrument=o["token_id"], label=o["label"] or "")
+                        self.governor, Proposal(o["strategy"], o["market_id"], wanted, venue="polymarket"),
+                        L, self.prices(), instrument=o["token_id"], label=o["label"] or "",
+                        price_for=maker_price)
                 except LedgerError as exc:
                     done(o["order_id"], "REFUSED", f"ledger: {exc}")
                     continue
                 if position is None:
                     done(o["order_id"], "REFUSED", f"risk governor: {decision['reason']}")
                     continue
-                L = o["limit_price"]
+                maker_cost = maker_costs.get(float(decision["approved_stake"]))
+                entry = float(position["entry_price"])
                 with self._db() as db:
                     db.execute(
                         "INSERT INTO paper_plans(position_id, token_id, market_id, entry_ask, entry_bid, entry_quote_at,"
-                        " stop_distance, stop_price, target_price, expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (position["position_id"], o["token_id"], o["market_id"], L, L, q["at"], o["stop"], round(L - o["stop"], 6),
-                         None if o["target"] is None else round(min(1.0, L + o["target"]), 6),
-                         (now + timedelta(hours=o["max_hold_hours"])).isoformat(timespec="seconds")))
+                        " stop_distance, stop_price, target_price, expires_at, entry_requested_stake,"
+                        " entry_slippage, entry_levels, entry_complete, entry_fill_price, entry_fee_usd,"
+                        " fee_category, entry_book, maker_entry) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                        (position["position_id"], o["token_id"], o["market_id"], entry, L, q["at"], o["stop"],
+                         max(0.0, round(entry - o["stop"], 6)),
+                         None if o["target"] is None else round(min(1.0, entry + o["target"]), 6),
+                         (now + timedelta(hours=o["max_hold_hours"])).isoformat(timespec="seconds"),
+                         float(o["stake"]), 0.0, 1.0, 1.0, L,
+                         (maker_cost.fee_usd if maker_cost else 0.0), category,
+                         json.dumps(q.get("levels")) if isinstance(q.get("levels"), dict) else None))
                 done(o["order_id"], "FILLED", f"ask {q['ask']:.3f} traded through {L:.3f}", position["position_id"])
                 summary["filled"].append({"order_id": o["order_id"], "strategy": o["strategy"], "price": L,
                                           "position_id": position["position_id"]})

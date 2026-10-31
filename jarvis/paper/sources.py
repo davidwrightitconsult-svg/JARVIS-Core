@@ -51,6 +51,7 @@ from jarvis.market.bars import regular
 from jarvis.strategies import LONG, REGISTRY, signal
 from jarvis.strategies import indicators as ta
 
+from .costs import round_trip
 from .engine import Order, PaperEngine
 
 SOURCES_VERSION = "12C.1"
@@ -61,6 +62,12 @@ TTL_MINUTES = 60.0
 STAKE = 20.0
 MAX_HOLD_HOURS = 48.0
 STOP_BASE, STOP_MAX, MIN_TARGET = 0.03, 0.08, 0.01
+# 18B: a target must clear the round trip by this much, not just MIN_TARGET. The old 1c floor was
+# below the cost of the trade it authorised -- a maker entry still pays the exit fee, which is about
+# 1.25c a share at mid prices in a 0.05 category, so a 1c target was a guaranteed loss on average.
+# Being a multiple of the MEASURED round trip means the floor adapts to where the trade is: cheap in
+# the tails and in zero-fee categories, expensive in wide mid-priced crypto markets.
+MIN_TARGET_MULTIPLE = 1.5
 MIN_BARS, MIN_OBSERVED = 22, 18              # of the last 24 hours, at least 18 must have a recorded price
 MIN_TRADES, MIN_DAYS, LOSS_LIMIT = 100, 14, 50.0
 Z = 1.96
@@ -168,7 +175,8 @@ class BollingerResting:
 
     def on_run(self, *_: Any) -> dict[str, Any]:
         """After a market scan: look at each two-outcome market once per completed hour."""
-        out = {"at": self.clock().isoformat(timespec="seconds"), "looked": 0, "signals": 0, "placed": 0, "refused": 0}
+        out = {"at": self.clock().isoformat(timespec="seconds"), "looked": 0, "signals": 0, "placed": 0,
+               "refused": 0, "refused_uneconomic": 0}
         if not self.enabled or not self.standing()["active"]:
             out["inactive"] = True
             self.last = out
@@ -197,8 +205,16 @@ class BollingerResting:
             fair = middle if side == LONG else 1.0 - middle          # the average, seen from the outcome being bought
             bid, ask = buy["best_bid"], buy["best_ask"]
             target = fair - bid
-            if target < MIN_TARGET:
+            # The entry rests at the bid, so it is a maker fill: no spread crossed and no entry
+            # fee. Getting OUT is still a taker fill, and that is what the target has to beat.
+            floor = MIN_TARGET
+            rt = round_trip(self.engine.settings.costs, bid, ask,
+                            self.engine._fee_category(m), maker_entry=True)
+            if rt is not None:
+                floor = max(MIN_TARGET, round(MIN_TARGET_MULTIPLE * rt.total, 4))
+            if target < floor:
                 out["refused"] += 1
+                out["refused_uneconomic"] += 1
                 continue
             stop = min(STOP_MAX, STOP_BASE + max(0.0, ask - bid))
             stake = STAKE

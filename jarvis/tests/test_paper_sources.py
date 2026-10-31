@@ -172,6 +172,44 @@ def test_the_source_places_a_resting_buy_on_the_books_signal_once_an_hour(rig):
     assert src.on_run()["signals"] == 0
 
 
+def test_the_target_must_clear_the_round_trip_not_just_a_flat_cent(rig):
+    """18B: MIN_TARGET was a flat 1c, below the cost of the trade it authorised. The floor is now a
+    multiple of the MEASURED round trip.
+
+    Note what that round trip is for this path. The entry RESTS at the bid, so no spread is crossed
+    going in; the exit sells at the bid, so none is crossed coming out either. A maker-in /
+    bid-out round trip therefore costs only the EXIT FEE -- which is why the maker path matters,
+    and why the floor here tracks the fee rather than the spread.
+
+    At 0.47 in a 0.07 category the exit fee is 1.7c a share, so the floor is 2.6c and this signal's
+    2.45c target does not clear it. The old flat 1c floor would have allowed it."""
+    eng, src, mk, clock, state, ledger = rig
+    eng.settings = PaperSettings(costs=CostSettings())          # fees ON for this one
+    mk.quote("m1", "yes1", 0.47, 0.49, "Yes", 0)
+    mk.quote("m1", "no1", 0.51, 0.53, "No", 1)
+    mk.past("yes1", dipped())
+    r = src.on_run()
+    assert r["signals"] == 1 and r["placed"] == 0
+    assert r["refused_uneconomic"] == 1
+    assert eng.resting(None) == []
+    assert sources.MIN_TARGET_MULTIPLE > 1.0
+
+
+def test_the_same_signal_is_placed_where_the_trade_is_cheaper(rig):
+    """The identical signal and target, in a venue whose exit costs nothing. That is the point of
+    measuring the floor rather than fixing it: the same prediction is worth trading in one market
+    and not in another."""
+    eng, src, mk, clock, state, ledger = rig
+    eng.settings = PaperSettings(costs=CostSettings(enabled=False))
+    mk.quote("m1", "yes1", 0.47, 0.49, "Yes", 0)
+    mk.quote("m1", "no1", 0.51, 0.53, "No", 1)
+    mk.past("yes1", dipped())
+    r = src.on_run()
+    assert r["signals"] == 1 and r["placed"] == 1 and r["refused_uneconomic"] == 0
+    [o] = eng.resting("PENDING")
+    assert o["target"] == pytest.approx(0.0245, abs=1e-4)
+
+
 def test_a_spike_buys_the_opposite_outcome(rig):
     eng, src, mk, clock, state, ledger = rig
     mk.quote("m2", "yes2", 0.50, 0.52, "Yes", 0)
