@@ -121,15 +121,24 @@ class PaperLedger:
             return self._row(db, cur.lastrowid)
 
     def open_checked(self, governor, proposal, price: float, prices: dict[int, float] | None = None,
-                     instrument: str = "", label: str = "") -> tuple[dict[str, Any], dict[str, Any] | None]:
+                     instrument: str = "", label: str = "",
+                     price_for: Callable[[float], float | None] | None = None
+                     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """10C: the one safe way in. The governor's decision and the opening happen under a single
         lock, so two proposals arriving together cannot both be sized against the same room.
-        Returns (decision, position); the position is None when the governor refused."""
+        Returns (decision, position); the position is None when the governor refused.
+
+        14A: `price_for` prices the fill against the stake the governor APPROVED, which may be
+        smaller than the one proposed. A smaller order walks less of the book, so pricing it at the
+        proposed size would overstate the cost. Returning None means the book could not fill it."""
         with self._entry:
             decision = governor.evaluate(proposal, self.portfolio(prices))
             if decision["verdict"] not in (APPROVED, REDUCED):
                 return decision, None
-            return decision, self.open(decision, price, instrument, label)
+            fill = price_for(float(decision["approved_stake"])) if price_for else price
+            if fill is None:
+                return {**decision, "reason": "no depth: the recorded book could not fill the approved stake"}, None
+            return decision, self.open(decision, fill, instrument, label)
 
     def close(self, position_id: int, exit_price: float, reason: str = "") -> dict[str, Any]:
         if not (isinstance(exit_price, (int, float)) and math.isfinite(exit_price) and exit_price >= 0):

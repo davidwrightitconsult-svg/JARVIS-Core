@@ -246,7 +246,10 @@ def _build_paper() -> None:
                                  max_spread=f("JARVIS_PAPER_MAX_SPREAD", d.max_spread),
                                  settle_before_minutes=f("JARVIS_PAPER_SETTLE_BEFORE_MINUTES", d.settle_before_minutes),
                                  settle_hold_above=(None if hold.lower() in ("none", "off") else
-                                                    float(hold) if hold else d.settle_hold_above))
+                                                    float(hold) if hold else d.settle_hold_above),
+                                 depth_aware=_env_on("JARVIS_PAPER_DEPTH_AWARE", True),
+                                 max_slippage=f("JARVIS_PAPER_MAX_SLIPPAGE", d.max_slippage),
+                                 min_depth_usd=f("JARVIS_PAPER_MIN_DEPTH_USD", d.min_depth_usd))
     except ValueError:
         settings = d
     paper_engine = PaperEngine(risk_governor, paper_ledger, quant.store, settings,

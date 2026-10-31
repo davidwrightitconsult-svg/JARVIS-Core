@@ -28,9 +28,14 @@ def rig(tmp_path):
                        [(YES, MKT, "Yes"), (NO, MKT, "No")])
         db.execute("INSERT INTO runs(observed_at, source) VALUES(?, 'scan')", (at,))
         for tok, bid, ask in ((YES, 0.48, 0.50), (NO, 0.49, 0.51)):
-            db.execute("INSERT INTO snapshots(run_id, observed_at, token_id, market_id, best_bid, best_ask,"
-                       " mid, spread, flags, usable) VALUES(1,?,?,?,?,?,?,?,'[]',1)",
-                       (at, tok, MKT, bid, ask, (bid + ask) / 2, ask - bid))
+            cur = db.execute("INSERT INTO snapshots(run_id, observed_at, token_id, market_id, best_bid, best_ask,"
+                             " mid, spread, flags, usable) VALUES(1,?,?,?,?,?,?,?,'[]',1)",
+                             (at, tok, MKT, bid, ask, (bid + ask) / 2, ask - bid))
+            # 14A: a market with no recorded book is not tradeable. Deep levels here keep these
+            # tests about signal selection rather than about the fill model.
+            db.executemany("INSERT INTO book_levels(snapshot_id, side, level, price, size, observed_at)"
+                           " VALUES(?,?,?,?,?,?)",
+                           [(cur.lastrowid, "bid", 0, bid, 2000.0, at), (cur.lastrowid, "ask", 0, ask, 2000.0, at)])
     state = RiskState(tmp_path / "risk.db")
     gate = {"approved_for_paper": ["MOMENTUM"], "forward_test": ["MEAN_REVERSION"], "live_approved": []}
     engine = PaperEngine(RiskGovernor(RiskSettings(), state, lambda: gate), PaperLedger(tmp_path / "risk.db", 1000.0),
