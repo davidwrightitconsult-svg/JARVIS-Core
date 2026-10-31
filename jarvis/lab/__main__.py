@@ -8,6 +8,7 @@ FRIDAY Validation Lab CLI (read-only).
     python -m jarvis.lab gate [--json]                                 what JARVIS may paper-trade (9C)
     python -m jarvis.lab edge [--days 30] [--json]                      after fees, against a coin flip (16A)
     python -m jarvis.lab calibrate [--seed 17] [--json]                 can the edge report measure? (17)
+    python -m jarvis.lab lifecycle [--json]                             signal -> fill -> exit -> settle (17B)
     python -m jarvis.lab bars [--bar-days 30] [--max-markets 500] [--minutes 60]
                                                                        build hourly price series (11B; reads Polymarket)
     python -m jarvis.lab bars-status [--json]                          what hourly history FRIDAY holds
@@ -20,6 +21,7 @@ Database: --db PATH, else $JARVIS_MARKET_DB, else ~/jarvis/data/market_data.db
 import argparse
 import json
 import os
+import pathlib
 import sys
 
 from jarvis.market.store import DEFAULT_MARKET_DB, MarketStore, MarketStoreError
@@ -32,7 +34,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m jarvis.lab", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=["backtest", "robustness", "inconsistencies", "gate", "edge",
-                                           "calibrate", "bars", "bars-status", "book-test", "book-results"])
+                                           "calibrate", "lifecycle", "bars", "bars-status",
+                                           "book-test", "book-results"])
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--days", type=float, default=30)
     parser.add_argument("--anchor", choices=["end", "resolution"], default="end")
@@ -48,6 +51,16 @@ def main(argv=None) -> int:
     parser.add_argument("--minutes", type=float, default=60)
     parser.add_argument("--workers", type=int, default=0)
     a = parser.parse_args(argv)
+    if a.command == "lifecycle":
+        # Also needs no store of its own: it is a rehearsal of the plumbing on a synthetic market.
+        import tempfile
+        from .lifecycle import render as render_lifecycle
+        from .lifecycle import run as run_lifecycle
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_lifecycle(pathlib.Path(tmp))
+        print(json.dumps(result, indent=2, default=str) if a.json else render_lifecycle(result))
+        return 0
+
     if a.command == "calibrate":
         # Needs no store of its own: it builds a synthetic one in a temp directory, because the
         # question is whether the measuring device works, not what any real market did.

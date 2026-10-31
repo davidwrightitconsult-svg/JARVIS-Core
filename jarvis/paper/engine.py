@@ -340,7 +340,12 @@ class PaperEngine:
                     " entry_levels, entry_complete, entry_fill_price, entry_fee_usd, fee_category, entry_book)"
                     " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (position["position_id"], order.token_id, str(order.market_id), entry, bid, q["at"],
-                     float(order.stop), round(entry - order.stop, 6),
+                     # A stop PRICE is a price: clamp it into [0, 1). SignalTrader deliberately
+                     # passes a stop DISTANCE of 0.999 to make the stop unreachable, which used to
+                     # record a stop_price of -0.48 -- behaviourally fine, since a bid can never
+                     # reach it, but meaningless as data and a trap for anything that reads the
+                     # column. Zero is equally unreachable while still being a price.
+                     float(order.stop), max(0.0, round(entry - order.stop, 6)),
                      None if order.target is None else round(min(1.0, entry + order.target), 6),
                      (now + timedelta(hours=float(order.max_hold_hours))).isoformat(timespec="seconds"),
                      float(order.stake), (fill.slippage if fill else 0.0),

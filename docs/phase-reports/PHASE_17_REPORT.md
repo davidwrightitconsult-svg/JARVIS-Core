@@ -120,6 +120,81 @@ Stated in the tool's own output, not just here:
 having plausible spreads and depth. Only forward paper trading on live data can say whether any
 real strategy has an edge — which remains the one thing this project has never done.
 
+---
+
+# Phase 17B — Does the whole machine turn?
+
+Phase 17 calibrated the *measuring* apparatus. This asks the other half, which nothing had ever
+asked as one question: does a signal actually become a position, and does that position survive
+every stage of the machine with depth, fees, atomicity and reporting intact?
+
+Every component is unit-tested in isolation. That is a different claim. A mis-wired observer order,
+a settings object that never reaches the engine, a fill priced against the wrong stake — each of
+those passes every unit test and breaks the platform.
+
+```
+  1. SIGNAL AND FILL (14A depth + 14B cost)
+     wanted $40 at the best ask 0.50, where only $5 rests
+     only $15.30 rests within 0.02 of it, so the order was cut to that BY THE BOOK,
+       not by the governor
+     approved $15.30 · walked 3 level(s) · filled at 0.51 (slippage 0.01)
+     fee $0.3749 (economy) folded in -> booked at 0.522495
+     stop set at 0.0 — measured from what was PAID, not from 0.50
+
+  2. EXIT (walks the bids, no slippage cap — leaving is not optional)
+     reason time · best bid 0.56 · sold at 0.55 (slippage 0.01) across 3 level(s)
+     gross +1.1713 − fees 0.7372 = booked PnL +0.4430
+
+  3. ARBITRAGE PAIR (15: both legs or neither, held to resolution)
+     two asks summed to 0.98 · 2 legs on ONE governor decision · equal shares: True
+     20.4 pairs cost $20.00 (fees $0.00) to lock $0.41
+     resolved: expected $0.41, realised $0.41, slippage +0.00 · pays exactly $1 a pair: True
+
+  4. WHAT THE REPORTS SAY
+     capacity ladder (stake, net, fill ratio):
+       [(10.0, +0.4417, 1.00), (40.0, -2.7719, 0.38), (200.0, -2.7719, 0.08)]
+     edge verdicts: {'RESEARCH_FORECAST': 'INSUFFICIENT_DATA'}
+```
+
+## What it found
+
+**A negative stop price.** `SignalTrader` deliberately passes a stop *distance* of 0.999 to make
+the stop unreachable, and the engine recorded `stop_price = entry - 0.999 = -0.4765`. Behaviourally
+correct — a bid can never reach it — but meaningless as data and a trap for anything that reads the
+column assuming prices are in `[0, 1]`. Now clamped to 0, which is equally unreachable and is a
+price.
+
+**A one-second miss in the scorer's exit window.** The window is
+`[expires_at, expires_at + max(1h, half the horizon)]`. The first run's exit snapshot landed one
+second past it and scored `NO_EXIT_DATA`, which is why the first edge report came back empty. Not a
+defect — but it means a scan cadence that straddles the window boundary silently loses signals, and
+nothing says so.
+
+**The demonstration mislabelled its own constraint.** The run reported "governor approved $15.30"
+when the governor had nothing to do with it: $15.30 is exactly the capacity inside the slippage
+band, so the *book* cut the order and the governor approved that in full. Worth getting right,
+because which constraint binds is the whole question when sizing.
+
+**Fees took 63% of a winning trade.** A gross gain of $1.17 became a booked $0.44. Not a bug — the
+point of 14B, arriving on a concrete trade rather than in a table.
+
+**Arbitrage legs never appear in the capacity report**, because they carry no plan row (that is how
+they stay out of reach of the engine's exits) and the report joins positions to plans. Correct by
+design, now asserted so it cannot change silently.
+
+## Running it
+```bash
+python -m jarvis.lab lifecycle            # one position, signal to settlement
+```
+
+## Verification
+19 tests (930 → 949), covering each stage's artifact plus the controls that matter: with
+`JARVIS_EXECUTE` off the identical lifecycle commits not a cent; a strategy the gate does not allow
+trades nothing; a market too thin is refused rather than filled generously; a resolved arbitrage
+market is never reopened.
+
+---
+
 ## Running it
 ```bash
 python -m jarvis.lab calibrate            # exits 0 if calibrated, 1 if not
