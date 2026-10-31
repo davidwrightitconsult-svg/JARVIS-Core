@@ -6,6 +6,8 @@ FRIDAY Validation Lab CLI (read-only).
     python -m jarvis.lab robustness [--half-spread 0.01] [--json]      horizons, leak, thresholds, real asks
     python -m jarvis.lab inconsistencies [--days 30] [--json]          both outcomes for under $1 (recorded asks)
     python -m jarvis.lab gate [--json]                                 what JARVIS may paper-trade (9C)
+    python -m jarvis.lab edge [--days 30] [--json]                      after fees, against a coin flip (16A)
+    python -m jarvis.lab calibrate [--seed 17] [--json]                 can the edge report measure? (17)
     python -m jarvis.lab bars [--bar-days 30] [--max-markets 500] [--minutes 60]
                                                                        build hourly price series (11B; reads Polymarket)
     python -m jarvis.lab bars-status [--json]                          what hourly history FRIDAY holds
@@ -29,7 +31,9 @@ from .backtest import BacktestSettings, render_text, run_backtest
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m jarvis.lab", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["backtest", "robustness", "inconsistencies", "gate", "bars", "bars-status", "book-test", "book-results"])
+    parser.add_argument("command", choices=["backtest", "robustness", "inconsistencies", "gate", "edge",
+                                           "calibrate", "bars", "bars-status", "book-test", "book-results"])
+    parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--days", type=float, default=30)
     parser.add_argument("--anchor", choices=["end", "resolution"], default="end")
     parser.add_argument("--db", default=os.getenv("JARVIS_MARKET_DB", DEFAULT_MARKET_DB))
@@ -44,6 +48,19 @@ def main(argv=None) -> int:
     parser.add_argument("--minutes", type=float, default=60)
     parser.add_argument("--workers", type=int, default=0)
     a = parser.parse_args(argv)
+    if a.command == "calibrate":
+        # Needs no store of its own: it builds a synthetic one in a temp directory, because the
+        # question is whether the measuring device works, not what any real market did.
+        import tempfile
+        from .rehearsal import Rehearsal, SimSettings, check, render
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic = MarketStore(os.path.join(tmp, "rehearsal.db"))
+            result = Rehearsal(settings=SimSettings(seed=a.seed)).run(synthetic)
+        verdicts = check(result)
+        print(json.dumps({**result, "calibration": verdicts}, indent=2, default=str)
+              if a.json else render(result, verdicts))
+        return 0 if verdicts["calibrated"] else 1
+
     path = os.path.expanduser(a.db)
     if not os.path.exists(path):
         print(f"no market store at {path}")
@@ -123,6 +140,13 @@ def main(argv=None) -> int:
         from .inconsistency import render_inconsistencies, scan_inconsistencies
         result = scan_inconsistencies(store, days=a.days, fee=settings.edge.fee)
         print(json.dumps(result, indent=2, default=str) if a.json else render_inconsistencies(result))
+        return 0
+    if a.command == "edge":
+        from jarvis.paper.costs import CostSettings
+        from .edge import render as render_edge
+        from .edge import report as edge_report
+        result = edge_report(store.outcomes(days=a.days, limit=100000), CostSettings())
+        print(json.dumps(result, indent=2, default=str) if a.json else render_edge(result))
         return 0
     if a.command == "gate":
         from .gate import build_gate, render_gate
