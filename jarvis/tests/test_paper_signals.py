@@ -68,7 +68,9 @@ def test_an_up_signal_becomes_a_position_with_no_stop_and_no_target(rig):
     pos = engine.ledger.positions("OPEN")[0]
     assert pos["instrument"] == YES and pos["strategy"] == "MOMENTUM" and pos["entry_price"] == 0.50
     plan = engine._plans()[pos["position_id"]]
-    assert plan["target_price"] is None and plan["stop_price"] < 0      # unreachable: the measured bet has no stop
+    # Unreachable: the measured bet has no stop. A stop distance of 0.999 would put the stop
+    # price below zero, so it is clamped to 0 -- a bid can never reach that either.
+    assert plan["target_price"] is None and plan["stop_price"] == 0.0
     assert engine.tick()["closed"] == []                                 # and nothing closes it early
 
 
