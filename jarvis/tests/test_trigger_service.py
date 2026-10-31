@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 
 from jarvis.market.store import MarketStore
+from jarvis.paper.costs import CostSettings
 from jarvis.paper import Order, PaperEngine, PaperSettings
 from jarvis.risk import PaperLedger, Proposal, RiskGovernor, RiskSettings, RiskState
 from jarvis.tests.test_trigger_agent import FakeWS, book, connector, pc
@@ -40,7 +41,9 @@ def rig(tmp_path):
     state = RiskState(tmp_path / "risk.db")
     governor = RiskGovernor(RiskSettings(), state, lambda: GATE)
     ledger = PaperLedger(tmp_path / "risk.db", 1000.0)
-    engine = PaperEngine(governor, ledger, store, PaperSettings())
+    engine = PaperEngine(governor, ledger, # 14B charges a taker fee on every fill. These tests are about the live feed, so fees are off here:
+    # otherwise every expected price would carry an unrelated term. See test_paper_costs.py.
+    store, PaperSettings(costs=CostSettings(enabled=False)))
     return store, engine, ledger
 
 
