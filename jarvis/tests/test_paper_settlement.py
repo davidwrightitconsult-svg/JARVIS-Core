@@ -46,13 +46,20 @@ def seed(store, clock, end_date, bid=0.48, ask=0.50):
     quote(store, clock, bid, ask)
 
 
-def quote(store, clock, bid, ask):
+def quote(store, clock, bid, ask, size=2000.0):
+    """A recorded snapshot AND its book. 14A refuses to trade a market with no recorded depth, so a
+    quote without levels is not a tradeable quote. `size` is deliberately deep: these tests are
+    about settlement, not about the fill model."""
+    clock.advance(seconds=1)                    # each quote is its own moment, so books never tie
     at = clock().isoformat(timespec="seconds")
     with store._db() as db:
         db.execute("INSERT INTO runs(observed_at, source) VALUES(?, 'scan')", (at,))
-        db.execute("INSERT INTO snapshots(run_id, observed_at, token_id, market_id, best_bid, best_ask, mid,"
-                   " spread, flags, usable) VALUES((SELECT MAX(run_id) FROM runs),?,?,?,?,?,?,?,'[]',1)",
-                   (at, YES, MKT, bid, ask, (bid + ask) / 2, ask - bid))
+        cur = db.execute("INSERT INTO snapshots(run_id, observed_at, token_id, market_id, best_bid, best_ask, mid,"
+                         " spread, flags, usable) VALUES((SELECT MAX(run_id) FROM runs),?,?,?,?,?,?,?,'[]',1)",
+                         (at, YES, MKT, bid, ask, (bid + ask) / 2, ask - bid))
+        db.executemany("INSERT INTO book_levels(snapshot_id, side, level, price, size, observed_at)"
+                       " VALUES(?,?,?,?,?,?)",
+                       [(cur.lastrowid, "bid", 0, bid, size, at), (cur.lastrowid, "ask", 0, ask, size, at)])
 
 
 def opened(engine, target=0.30):

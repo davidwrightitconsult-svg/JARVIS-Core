@@ -30,8 +30,12 @@ def rig(tmp_path):
         db.executemany("INSERT INTO outcomes(token_id, market_id, name) VALUES(?,?,?)",
                        [(YES, MKT, "Yes"), (NO, MKT, "No")])
         db.execute("INSERT INTO runs(observed_at, source) VALUES(?, 'scan')", (iso(5),))
-        db.execute("INSERT INTO snapshots(run_id, observed_at, token_id, market_id, best_bid, best_ask, mid, spread, flags,"
-                   " usable) VALUES(1,?,?,?,0.48,0.50,0.49,0.02,'[]',1)", (iso(5), YES, MKT))
+        cur = db.execute("INSERT INTO snapshots(run_id, observed_at, token_id, market_id, best_bid, best_ask, mid,"
+                         " spread, flags, usable) VALUES(1,?,?,?,0.48,0.50,0.49,0.02,'[]',1)", (iso(5), YES, MKT))
+        # 14A: entries need a recorded book. Deep levels keep these tests about the trigger.
+        db.executemany("INSERT INTO book_levels(snapshot_id, side, level, price, size, observed_at)"
+                       " VALUES(?,?,?,?,?,?)",
+                       [(cur.lastrowid, "bid", 0, 0.48, 2000.0, iso(5)), (cur.lastrowid, "ask", 0, 0.50, 2000.0, iso(5))])
     store.watch([MKT])
     state = RiskState(tmp_path / "risk.db")
     governor = RiskGovernor(RiskSettings(), state, lambda: GATE)

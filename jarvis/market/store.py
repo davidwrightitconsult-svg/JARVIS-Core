@@ -307,7 +307,10 @@ class MarketStore:
         with self._db() as db:
             snap = db.execute(
                 "SELECT snapshot_id, observed_at FROM snapshots WHERE token_id=?"
-                + (" AND observed_at=?" if observed_at else "") + " ORDER BY observed_at DESC LIMIT 1",
+                + (" AND observed_at=?" if observed_at else "")
+                # snapshot_id breaks the tie: two runs can share a timestamp, and the book of the
+                # LATEST of them is the one that belongs with the quote being filled.
+                + " ORDER BY observed_at DESC, snapshot_id DESC LIMIT 1",
                 (token_id, observed_at) if observed_at else (token_id,)).fetchone()
             if snap is None:
                 return {"token_id": token_id, "observed_at": None, "bids": [], "asks": []}

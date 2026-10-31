@@ -179,7 +179,7 @@ def test_app_wiring_is_read_only(tmp_path, monkeypatch):
     with TestClient(main.app) as c:
         assert main.paper_engine is not None and main.paper_engine.tick in main.poly.observers
         p = c.get("/api/paper").json()
-        assert p["paper_version"] == "12C.1" and p["mode"] == "PAPER" and p["positions"] == [] and p["trades"] == []
+        assert p["paper_version"] == "14A.1" and p["mode"] == "PAPER" and p["positions"] == [] and p["trades"] == []
         assert p["live_trading"] == "LOCKED" and c.post("/api/paper", json={}).status_code == 405
         d = c.get("/api/dashboard").json()
         assert d["paper"]["open"] == 0 and d["system"]["components"]["paper"] == "READY"
