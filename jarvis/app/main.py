@@ -131,6 +131,7 @@ paper_ledger = None             # friday.risk.PaperLedger (Phase 10B)
 paper_engine = None             # friday.paper.PaperEngine (Phase 12A)
 paper_source = None             # friday.paper.BollingerResting (Phase 12B forward test)
 signal_trader = None            # jarvis.paper.SignalTrader (Phase 13C: trades what the gate allows)
+pair_trader = None              # jarvis.paper.PairTrader (Phase 15: the riskless pair, both legs or none)
 trigger_service = None          # jarvis.trigger.TriggerService (Phase 13A real-time feed; off by default)
 trigger_status: dict = {"enabled": False, "reason": "not started"}
 risk_status: dict = {"enabled": False, "reason": "not started"}
@@ -228,13 +229,14 @@ def _build_risk() -> None:
 def _build_paper() -> None:
     """12A: the paper trading engine. It needs the governor, the ledger and the market store; without
     any of them it stays OFF. It checks its open positions after every stored market scan."""
-    global paper_engine, paper_source, signal_trader
-    paper_engine = paper_source = signal_trader = None
+    global paper_engine, paper_source, signal_trader, pair_trader
+    paper_engine = paper_source = signal_trader = pair_trader = None
     _backtest_cache.pop("gate", None)           # a gate built before this start may list other forward tests
     if risk_governor is None or paper_ledger is None or quant is None:
         state.set_component("paper", "DISABLED")
         return
     from jarvis.paper import PaperEngine, PaperSettings
+    from jarvis.paper.costs import CostSettings
 
     def f(name, default):
         raw = os.getenv(name, "").strip()
@@ -246,22 +248,35 @@ def _build_paper() -> None:
                                  max_spread=f("JARVIS_PAPER_MAX_SPREAD", d.max_spread),
                                  settle_before_minutes=f("JARVIS_PAPER_SETTLE_BEFORE_MINUTES", d.settle_before_minutes),
                                  settle_hold_above=(None if hold.lower() in ("none", "off") else
-                                                    float(hold) if hold else d.settle_hold_above))
+                                                    float(hold) if hold else d.settle_hold_above),
+                                 depth_aware=_env_on("JARVIS_PAPER_DEPTH_AWARE", True),
+                                 max_slippage=f("JARVIS_PAPER_MAX_SLIPPAGE", d.max_slippage),
+                                 min_depth_usd=f("JARVIS_PAPER_MIN_DEPTH_USD", d.min_depth_usd),
+                                 costs=CostSettings(
+                                     enabled=_env_on("JARVIS_PAPER_FEES", True),
+                                     fee_multiplier=f("JARVIS_PAPER_FEE_MULTIPLIER", d.costs.fee_multiplier),
+                                     gas_usd_per_fill=f("JARVIS_PAPER_GAS_USD", d.costs.gas_usd_per_fill)))
     except ValueError:
         settings = d
     paper_engine = PaperEngine(risk_governor, paper_ledger, quant.store, settings,
                                resolver=getattr(poly, "market_resolutions", None))
-    from jarvis.paper import BollingerResting, SignalTrader
+    from jarvis.paper import BollingerResting, PairTrader, SignalTrader
     paper_source = BollingerResting(paper_engine, quant.store, enabled=_env_on("JARVIS_PAPER_BOLLINGER"))
     # 13C: the gate could approve a strategy and nothing would trade it. This is the hands for the
     # gate's own judgement; it originates nothing. OFF unless JARVIS_PAPER_SIGNALS=true.
     signal_trader = SignalTrader(paper_engine, quant.store, gate_provider=lab_gate,
                                  enabled=_env_on("JARVIS_PAPER_SIGNALS", False),
                                  stake=f("JARVIS_PAPER_SIGNAL_STAKE", 20.0))
+    # 15: the riskless pair the 9C scan has been finding since Phase 9. OFF unless JARVIS_PAPER_ARB=true.
+    pair_trader = PairTrader(paper_engine, quant.store, gate_provider=lab_gate,
+                             enabled=_env_on("JARVIS_PAPER_ARB", False),
+                             budget=f("JARVIS_PAPER_ARB_BUDGET", 50.0),
+                             min_locked_per_pair=f("JARVIS_PAPER_ARB_MIN_LOCKED", 0.005))
     if hasattr(poly, "observers"):
         poly.observers.append(paper_engine.tick)          # fills and exits first,
         poly.observers.append(paper_source.on_run)        # then new resting orders,
-        poly.observers.append(signal_trader.on_run)       # then the gate-allowed signals
+        poly.observers.append(signal_trader.on_run)       # then the gate-allowed signals,
+        poly.observers.append(pair_trader.on_run)         # then the arbitrage pairs
     state.set_component("paper", "READY")
 
 
@@ -735,6 +750,8 @@ def paper_view(trades: int = 50):
                   "expires_at": plans.get(p["position_id"], {}).get("expires_at")} for p in paper_ledger.positions("OPEN")]
     return {**paper_engine.report(), "positions": open_rows, "trades": paper_engine.trades(max(1, min(int(trades), 500))),
             "resting": paper_engine.resting("PENDING", 100), "settlement": paper_engine.settlement_report(),
+            "capacity": paper_engine.capacity_report(),
+            "arbitrage": pair_trader.report(100) if pair_trader is not None else {"enabled": False},
             "signal_trading": signal_trader.report(100) if signal_trader is not None else {"enabled": False},
             "forward_tests": [{**paper_source.standing(), "last_run": paper_source.last}] if paper_source is not None else []}
 

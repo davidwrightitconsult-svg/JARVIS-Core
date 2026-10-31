@@ -43,7 +43,7 @@ from typing import Any, Awaitable, Callable, Iterable
 
 log = logging.getLogger("jarvis.trigger")
 
-TRIGGER_VERSION = "13A.1"
+TRIGGER_VERSION = "14A.1"
 CLOB_MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
@@ -94,7 +94,8 @@ class TriggerSignal:
 
 SignalHandler = Callable[[TriggerSignal], Awaitable[None]]
 AssetProvider = Callable[[], Awaitable[Iterable[str]]]
-QuoteHook = Callable[[str, str, float, float, float], None]   # token, market, bid, ask, epoch seconds
+# token, market, bid, ask, epoch seconds, book ({"bids": [[price, size], ...], "asks": [...]} or None)
+QuoteHook = Callable[[str, str, float, float, float, dict[str, Any] | None], None]
 ResolvedHook = Callable[[dict[str, Any]], Awaitable[None]]
 
 
@@ -103,6 +104,7 @@ class _Asset:
     market: str = ""
     bid: float | None = None
     ask: float | None = None
+    book: dict[str, Any] | None = None       # 14A: the last full book snapshot, for the fill model
     eval_mid: float | None = None
     eval_at: float = 0.0
 
@@ -117,6 +119,7 @@ class TriggerStats:
     coalesced: int = 0
     handler_errors: int = 0
     resolutions: int = 0
+    book_desync: int = 0
     watching: int = 0
     last_frame_age_s: float | None = None
     last_error: str | None = None
@@ -178,7 +181,8 @@ class TriggerAgent:
         age = None if not s.connected else round(time.monotonic() - self._last_frame, 1)
         return {"version": TRIGGER_VERSION, "connected": s.connected, "connects": s.connects, "watching": s.watching,
                 "frames": s.frames, "quotes": s.quotes, "signals": s.signals, "coalesced": s.coalesced,
-                "handler_errors": s.handler_errors, "resolutions": s.resolutions, "last_frame_age_s": age,
+                "handler_errors": s.handler_errors, "resolutions": s.resolutions,
+                "book_desync": s.book_desync, "last_frame_age_s": age,
                 "last_error": s.last_error, "endpoint": self.cfg.ws_url}
 
     # ----------------------------------------------------------------- session
@@ -264,12 +268,23 @@ class TriggerAgent:
         kind, market = ev.get("event_type"), ev.get("market", "")
         if kind == "book":
             bids, asks = ev.get("bids") or [], ev.get("asks") or []
+            # Polymarket sends levels worst-first; the fill model needs them best-first.
+            book = {"bids": sorted(_levels(bids), key=lambda lv: -lv[0]),
+                    "asks": sorted(_levels(asks), key=lambda lv: lv[0])}
             self._update(ev.get("asset_id", ""), market,
-                         max((_f(b.get("price")) or 0.0 for b in bids), default=None) or None,
-                         min((p for p in (_f(a.get("price")) for a in asks) if p), default=None))
+                         book["bids"][0][0] if book["bids"] else None,
+                         book["asks"][0][0] if book["asks"] else None, book=book)
         elif kind == "price_change":
+            per_token: dict[str, list[Any]] = {}
             for pc in ev.get("price_changes") or []:
-                self._update(pc.get("asset_id", ""), market, _f(pc.get("best_bid")), _f(pc.get("best_ask")))
+                token = pc.get("asset_id", "")
+                price, size = _f(pc.get("price")), _f(pc.get("size"))
+                entry = per_token.setdefault(token, [_f(pc.get("best_bid")), _f(pc.get("best_ask")), []])
+                entry[0], entry[1] = _f(pc.get("best_bid")), _f(pc.get("best_ask"))
+                if price is not None and size is not None and 0 < price <= 1:
+                    entry[2].append((str(pc.get("side", "")).upper(), price, size))
+            for token, (bid, ask, changes) in per_token.items():
+                self._update(token, market, bid, ask, changes=changes)
         elif kind == "best_bid_ask":
             self._update(ev.get("asset_id", ""), market, _f(ev.get("best_bid")), _f(ev.get("best_ask")))
         elif kind == "market_resolved":
@@ -283,11 +298,23 @@ class TriggerAgent:
                 except Exception:                                  # noqa: BLE001
                     log.exception("resolution hook failed")
 
-    def _update(self, token: str, market: str, bid: float | None, ask: float | None) -> None:
+    def _update(self, token: str, market: str, bid: float | None, ask: float | None,
+                book: dict[str, Any] | None = None, changes: list[Any] | None = None) -> None:
         if not token or token not in self._watching:
             return
         a = self._assets.setdefault(token, _Asset())
         a.market = market or a.market
+        if book is not None:
+            a.book = book
+        elif a.book is not None:
+            # A price_change carries the new size resting at a price, so the book can be kept
+            # current between full snapshots. If the result disagrees with the best bid/ask the
+            # same frame reports, we have missed a change: drop the depth and wait for a snapshot
+            # rather than price a fill against a book we know is wrong.
+            a.book = _apply_changes(a.book, changes) if changes else None
+            if a.book is not None and not _agrees(a.book, bid, ask):
+                a.book = None
+                self.stats.book_desync += 1
         if bid is not None and bid > 0:
             a.bid = bid
         if ask is not None and ask > 0:
@@ -297,7 +324,7 @@ class TriggerAgent:
         self.stats.quotes += 1
         if self.on_quote:
             try:
-                self.on_quote(token, a.market, a.bid, a.ask, time.time())
+                self.on_quote(token, a.market, a.bid, a.ask, time.time(), a.book)
             except Exception:                                      # noqa: BLE001
                 log.exception("quote hook failed")
         prio = bool(self.priority(token))
@@ -349,6 +376,40 @@ class TriggerAgent:
             await asyncio.wait_for(self._stop.wait(), timeout=seconds)
         except TimeoutError:
             pass
+
+
+def _levels(raw: Any) -> list[list[float]]:
+    out = []
+    for lv in raw if isinstance(raw, list) else ():
+        price = _f(lv.get("price") if isinstance(lv, dict) else None)
+        size = _f(lv.get("size") if isinstance(lv, dict) else None)
+        if price is not None and size is not None and 0 < price <= 1 and size > 0:
+            out.append([price, size])
+    return out
+
+
+def _apply_changes(book: dict[str, Any], changes: list[Any]) -> dict[str, Any]:
+    """Fold price_change levels into a book already held. A size of 0 means the level is gone."""
+    sides = {"bids": dict(book.get("bids") or []), "asks": dict(book.get("asks") or [])}
+    for side, price, size in changes:
+        level = sides["bids" if side == "BUY" else "asks"]
+        if size <= 0:
+            level.pop(price, None)
+        else:
+            level[price] = size
+    return {"bids": sorted(([p, s] for p, s in sides["bids"].items()), key=lambda lv: -lv[0]),
+            "asks": sorted(([p, s] for p, s in sides["asks"].items()), key=lambda lv: lv[0])}
+
+
+def _agrees(book: dict[str, Any], bid: float | None, ask: float | None) -> bool:
+    """Does the maintained book's top match the best bid/ask the feed just reported?"""
+    for key, reported in (("bids", bid), ("asks", ask)):
+        levels = book.get(key) or []
+        if reported is None:
+            continue
+        if not levels or abs(levels[0][0] - reported) > 1e-9:
+            return False
+    return True
 
 
 def _f(v: Any) -> float | None:

@@ -32,15 +32,19 @@ measures the real cost a backtest could only assume.
 
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-PAPER_VERSION = "12C.1"
+from .costs import CostSettings, cost_of
+from .fills import buy_for_stake, capacity, sell_shares
+
+PAPER_VERSION = "14B.1"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS paper_plans(
@@ -84,12 +88,22 @@ class PaperSettings:
     min_price: float = 0.05                 # no entry in the tails
     max_price: float = 0.95
     exit_quote_age_minutes: float = 60.0    # an exit may use a quote up to this old
+    # 14B COSTS: the taker fee folded into every booked price, so that drawdown, the scorecard and
+    # the validation gate all see net-of-fee numbers without each having to know about fees.
+    costs: CostSettings = dc_field(default_factory=CostSettings)
     # 13B SETTLEMENT: close this many minutes before the market's end date, rather than holding into
     # resolution, where the book thins out and the spread widens (the liquidity trap). 0 = hold.
     settle_before_minutes: float = 30.0
     # A position whose bid is already this high is left to resolve: selling would pay more in spread
     # than holding could still gain. None = always exit. This is a cost rule, not a view on the outcome.
     settle_hold_above: float | None = 0.97
+    # 14A DEPTH: fill by walking the recorded book instead of taking any size at the best price.
+    depth_aware: bool = True
+    # How far past the best price we will walk on an ENTRY. Levels beyond it are left alone, exactly
+    # as a limit order would, so a fill may be partial.
+    max_slippage: float = 0.02
+    # A book that cannot absorb at least this much is not worth entering at all.
+    min_depth_usd: float = 5.0
 
     def __post_init__(self):
         if not (0 < self.max_quote_age_minutes <= 240 and 0 < self.exit_quote_age_minutes <= 1440):
@@ -100,6 +114,10 @@ class PaperSettings:
             raise ValueError("settle_before_minutes must be between 0 (hold) and 1440")
         if self.settle_hold_above is not None and not (0.5 < self.settle_hold_above <= 1):
             raise ValueError("settle_hold_above must be in (0.5, 1] or None")
+        if not 0 < self.max_slippage <= 0.25:
+            raise ValueError("max_slippage must be in (0, 0.25]")
+        if self.min_depth_usd <= 0:
+            raise ValueError("min_depth_usd must be > 0")
 
 
 @dataclass(frozen=True)
@@ -132,6 +150,24 @@ class PaperEngine:
         self.last_tick: dict[str, Any] | None = None
         with self._db() as db:
             db.executescript(_SCHEMA)
+            self._migrate(db)
+
+    @staticmethod
+    def _migrate(db: sqlite3.Connection) -> None:
+        """14A: additive, idempotent columns recording what the fill really cost."""
+        cols = {r["name"] for r in db.execute("PRAGMA table_info(paper_plans)").fetchall()}
+        for name in ("entry_requested_stake", "entry_slippage", "entry_levels", "entry_complete",
+                     "exit_slippage", "exit_levels", "exit_complete",
+                     # 14B: the fee each side of the round trip was charged, and the raw fill price
+                     # before it, so the cost of trading can be separated from the cost of size.
+                     "entry_fill_price", "entry_fee_usd", "exit_fill_price", "exit_fee_usd"):
+            if name not in cols:
+                db.execute(f"ALTER TABLE paper_plans ADD COLUMN {name} REAL")
+        # The books themselves, so "at what size does this edge disappear?" can be answered by
+        # re-walking the real depth rather than extrapolating from a single filled size.
+        for name in ("fee_category", "entry_book", "exit_book"):
+            if name not in cols:
+                db.execute(f"ALTER TABLE paper_plans ADD COLUMN {name} TEXT")
 
     @contextmanager
     def _db(self):
@@ -153,7 +189,8 @@ class PaperEngine:
         q = self.store.quote_near(token_id, now, max_age_minutes / 60.0)
         if q:
             bid, ask = q.get("best_bid"), q.get("best_ask")
-            stored = {"bid": bid if ok(bid) else None, "ask": ask if ok(ask) else None, "at": q["observed_at"]}
+            stored = {"bid": bid if ok(bid) else None, "ask": ask if ok(ask) else None, "at": q["observed_at"],
+                      "levels": self._levels(token_id, q["observed_at"])}
         live = self._live_quote(token_id, now_dt, max_age_minutes, ok)
         if live and (stored is None or live["at"] >= stored["at"]):   # a tie goes to the stream
             return live
@@ -172,7 +209,36 @@ class PaperEngine:
             return None
         if q["at"] < (now - timedelta(minutes=max_age_minutes)).isoformat(timespec="seconds"):
             return None
-        return {"bid": q["bid"], "ask": q["ask"], "at": q["at"]}
+        return {"bid": q["bid"], "ask": q["ask"], "at": q["at"], "levels": q.get("levels")}
+
+    def _fee_category(self, market_id: str) -> str:
+        """Polymarket's fee rate depends on the market's category, so the fee cannot be known
+        without classifying the question. An unreadable market falls through to the highest rate."""
+        try:
+            from jarvis.market.segments import category_of, segment_of
+            with self.store._db() as db:
+                r = db.execute("SELECT question, neg_risk FROM markets WHERE market_id=?",
+                               (str(market_id),)).fetchone()
+            if not r:
+                return "unknown"
+            question = r["question"]
+            if segment_of(question, r["neg_risk"]) == "sports":
+                return "sports"
+            return category_of(question)
+        except Exception:                                      # noqa: BLE001
+            return "unknown"
+
+    def _levels(self, token_id: str, observed_at: str) -> dict[str, Any] | None:
+        """The book FRIDAY recorded in the snapshot this quote came from. None when the store cannot
+        report depth at all (a minimal store in a test); an empty book is a real answer, not None."""
+        reader = getattr(self.store, "levels", None)
+        if reader is None:
+            return None
+        try:
+            book = reader(token_id, observed_at)
+        except Exception:                                      # noqa: BLE001
+            return None
+        return book if isinstance(book, dict) else None
 
     def live_tokens(self) -> set[str]:
         """Tokens whose price can change what this engine does right now: held positions and
@@ -223,23 +289,64 @@ class PaperEngine:
             if bid is None or ask - bid > s.max_spread + 1e-9:
                 return self._refuse(order, "no bid recorded" if bid is None else
                                     f"spread {ask - bid:.3f} is wider than {s.max_spread:g}")
+            # 14A: what the book can actually absorb, and what walking it would really cost.
+            asks = (q.get("levels") or {}).get("asks") if isinstance(q.get("levels"), dict) else None
+            depth_on = self.settings.depth_aware and asks is not None
+            room = capacity(asks, self.settings.max_slippage) if depth_on else float(order.stake)
+            if depth_on and room < s.min_depth_usd:
+                return self._refuse(order, f"not enough depth: ${room:.2f} rests within "
+                                           f"{self.settings.max_slippage:g} of the best ask")
+            wanted = min(float(order.stake), room) if depth_on else float(order.stake)
+
+            fills: dict[float, Any] = {}
+            costs: dict[float, Any] = {}
+            category = self._fee_category(order.market_id)
+
+            def price_for(approved: float) -> float | None:
+                """Price the fill against the stake the governor approved, not the one requested,
+                and fold in the taker fee so everything downstream sees a net-of-cost position."""
+                if depth_on:
+                    fill = buy_for_stake(asks, approved, self.settings.max_slippage)
+                    fills[approved] = fill
+                    raw, shares = fill.price, fill.shares
+                else:
+                    raw, shares = ask, (approved / ask if ask else 0.0)
+                if raw is None:
+                    return None
+                cost = cost_of(s.costs, shares, raw, category)
+                costs[approved] = cost
+                return min(0.9999, round(raw + cost.per_share, 6))
+
             from jarvis.risk import LedgerError, Proposal
             try:
                 decision, position = self.ledger.open_checked(
-                    self.governor, Proposal(order.strategy, order.market_id, float(order.stake), venue="polymarket"),
-                    ask, self.prices(), instrument=order.token_id, label=order.label)
+                    self.governor, Proposal(order.strategy, order.market_id, wanted, venue="polymarket"),
+                    ask, self.prices(), instrument=order.token_id, label=order.label, price_for=price_for)
             except LedgerError as exc:
                 return self._refuse(order, f"ledger: {exc}")
             if position is None:
                 return self._refuse(order, f"risk governor: {decision['reason']}", decision)
             now = self.clock()
+            approved = float(decision["approved_stake"])
+            fill = fills.get(approved)
+            cost = costs.get(approved)
+            # The stop and the target hang off the price we REALLY paid, not the best ask we hoped
+            # for. A fill that walked the book starts further from its stop than the plan intended.
+            entry = float(position["entry_price"])
             with self._db() as db:
                 db.execute(
                     "INSERT INTO paper_plans(position_id, token_id, market_id, entry_ask, entry_bid, entry_quote_at,"
-                    " stop_distance, stop_price, target_price, expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (position["position_id"], order.token_id, str(order.market_id), ask, bid, q["at"], float(order.stop),
-                     round(ask - order.stop, 6), None if order.target is None else round(min(1.0, ask + order.target), 6),
-                     (now + timedelta(hours=float(order.max_hold_hours))).isoformat(timespec="seconds")))
+                    " stop_distance, stop_price, target_price, expires_at, entry_requested_stake, entry_slippage,"
+                    " entry_levels, entry_complete, entry_fill_price, entry_fee_usd, fee_category, entry_book)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (position["position_id"], order.token_id, str(order.market_id), entry, bid, q["at"],
+                     float(order.stop), round(entry - order.stop, 6),
+                     None if order.target is None else round(min(1.0, entry + order.target), 6),
+                     (now + timedelta(hours=float(order.max_hold_hours))).isoformat(timespec="seconds"),
+                     float(order.stake), (fill.slippage if fill else 0.0),
+                     float(fill.levels_used if fill else 1), 1.0 if (fill is None or fill.complete) else 0.0,
+                     (fill.price if fill else ask), (cost.fee_usd if cost else 0.0), category,
+                     json.dumps(q.get("levels")) if isinstance(q.get("levels"), dict) else None))
         try:
             self.store.watch([str(order.market_id)])           # keep recording this market while it is held
         except Exception:
@@ -349,12 +456,43 @@ class PaperEngine:
             return {r["position_id"]: dict(r) for r in db.execute(
                 "SELECT * FROM paper_plans WHERE exit_reason IS NULL").fetchall()}
 
-    def _close(self, position: dict[str, Any], price: float, reason: str, quote: dict[str, Any] | None) -> dict[str, Any]:
-        closed = self.ledger.close(position["position_id"], price, reason)
+    def _exit_fill(self, position: dict[str, Any], quote: dict[str, Any] | None):
+        """14A: what selling this whole position into the recorded bids would really fetch.
+
+        No slippage cap here: an exit is not optional, so the model walks what the book shows. It
+        is still optimistic — it assumes the whole visible book is ours — but it no longer pretends
+        an entire position clears at the best bid. Returns None when depth is unavailable."""
+        if not self.settings.depth_aware or not quote:
+            return None
+        levels = quote.get("levels")
+        bids = levels.get("bids") if isinstance(levels, dict) else None
+        if not bids:
+            return None
+        fill = sell_shares(bids, float(position["units"]))
+        return fill if fill.price is not None else None
+
+    def _close(self, position: dict[str, Any], price: float, reason: str, quote: dict[str, Any] | None,
+               fill=None) -> dict[str, Any]:
         with self._db() as db:
-            db.execute("UPDATE paper_plans SET exit_bid=?, exit_ask=?, exit_quote_at=?, exit_reason=? WHERE position_id=?",
+            row = db.execute("SELECT fee_category FROM paper_plans WHERE position_id=?",
+                             (position["position_id"],)).fetchone()
+        # 14B: the taker is charged on the way out as well. Netting it off the exit price keeps the
+        # ledger's own arithmetic the single source of PnL instead of adding a second, parallel one.
+        cost = cost_of(self.settings.costs, float(position["units"]), price,
+                       row["fee_category"] if row else None)
+        net = max(0.0, round(price - cost.per_share, 6))
+        closed = self.ledger.close(position["position_id"], net, reason)
+        with self._db() as db:
+            db.execute("UPDATE paper_plans SET exit_bid=?, exit_ask=?, exit_quote_at=?, exit_reason=?,"
+                       " exit_slippage=?, exit_levels=?, exit_complete=?, exit_fill_price=?, exit_fee_usd=?,"
+                       " exit_book=? WHERE position_id=?",
                        (quote["bid"] if quote else None, quote["ask"] if quote else None, quote["at"] if quote else None,
-                        reason, position["position_id"]))
+                        reason, fill.slippage if fill else None,
+                        float(fill.levels_used) if fill else None,
+                        (1.0 if fill.complete else 0.0) if fill else None,
+                        price, cost.fee_usd,
+                        json.dumps(quote.get("levels")) if quote and isinstance(quote.get("levels"), dict) else None,
+                        position["position_id"]))
         return closed
 
     @staticmethod
@@ -390,6 +528,28 @@ class PaperEngine:
                 (closed["position_id"], plan["token_id"], str(closed["market_id"]),
                  now.isoformat(timespec="seconds"), str(ends.get(str(closed["market_id"])) or ""),
                  float(closed["exit_price"]), float(closed["units"]), float(closed["proceeds"])))
+
+    def capacity_report(self, ladder=None) -> dict[str, Any]:
+        """14B: at what size does each strategy's edge stop existing? Re-walks the real books every
+        closed trade entered against and exited into, at a ladder of larger stakes."""
+        from .capacity import LADDER, report
+        sql = ("SELECT p.strategy, p.units, pl.entry_fill_price, pl.entry_fee_usd, pl.exit_fill_price,"
+               " pl.exit_fee_usd, pl.fee_category, pl.entry_book, pl.exit_book"
+               " FROM paper_positions p JOIN paper_plans pl ON pl.position_id = p.position_id"
+               " WHERE p.status='CLOSED'")
+        try:
+            with self._db() as db:
+                rows = [dict(r) for r in db.execute(sql).fetchall()]
+        except sqlite3.Error:
+            # The plans and the positions live in separate databases in some deployments; without
+            # the join there is nothing to replay, and saying so beats a 500.
+            return {"version": "14B.1", "strategies": {}, "note": "positions and plans are not joinable here"}
+        out = report(rows, self.settings.costs, ladder or LADDER,
+                     self.settings.max_slippage, self.settings.min_depth_usd)
+        out["costs"] = {"enabled": self.settings.costs.enabled,
+                        "fee_multiplier": self.settings.costs.fee_multiplier,
+                        "gas_usd_per_fill": self.settings.costs.gas_usd_per_fill}
+        return out
 
     def settlement_report(self) -> dict[str, Any]:
         """13B: did exiting before resolution help or cost? For every settled position whose market
@@ -458,15 +618,18 @@ class PaperEngine:
                         summary["waiting_for_a_price"] += 1
                         continue
                     elif q["bid"] <= plan["stop_price"] + 1e-9:
-                        done = self._close(p, q["bid"], "stop", q)
+                        ex = self._exit_fill(p, q)
+                        done = self._close(p, ex.price if ex else q["bid"], "stop", q, ex)
                     elif plan["target_price"] is not None and q["bid"] >= plan["target_price"] - 1e-9:
                         done = self._close(p, plan["target_price"], "target", q)
                     elif self._settlement_due(p["market_id"], q["bid"], ends, now):
-                        done = self._close(p, q["bid"], "settlement", q)
+                        ex = self._exit_fill(p, q)
+                        done = self._close(p, ex.price if ex else q["bid"], "settlement", q, ex)
                         self._record_settlement(done, plan, ends, now)
                         summary["settled"] += 1
                     elif now.isoformat(timespec="seconds") >= plan["expires_at"]:
-                        done = self._close(p, q["bid"], "time", q)
+                        ex = self._exit_fill(p, q)
+                        done = self._close(p, ex.price if ex else q["bid"], "time", q, ex)
                     else:
                         continue
                 except Exception as exc:                       # one bad position must not stop the others

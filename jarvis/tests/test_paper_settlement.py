@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from jarvis.market.store import MarketStore
+from jarvis.paper.costs import CostSettings
 from jarvis.paper import Order, PaperEngine, PaperSettings
 from jarvis.risk import PaperLedger, RiskGovernor, RiskSettings, RiskState
 from jarvis.tests.test_trigger_agent import FakeWS, connector
@@ -32,7 +33,10 @@ def rig(tmp_path):
     store = MarketStore(tmp_path / "market.db")
     state = RiskState(tmp_path / "risk.db")
     engine = PaperEngine(RiskGovernor(RiskSettings(), state, lambda: GATE, clock),
-                         PaperLedger(tmp_path / "risk.db", 1000.0, clock), store, PaperSettings(), clock=clock)
+                         PaperLedger(tmp_path / "risk.db", 1000.0, clock), # 14B charges a taker fee on every fill. These tests are about settlement, so fees are off here:
+    # otherwise every expected price would carry an unrelated term. See test_paper_costs.py.
+    store,
+                         PaperSettings(costs=CostSettings(enabled=False)), clock=clock)
     return store, engine, clock
 
 
@@ -46,13 +50,20 @@ def seed(store, clock, end_date, bid=0.48, ask=0.50):
     quote(store, clock, bid, ask)
 
 
-def quote(store, clock, bid, ask):
+def quote(store, clock, bid, ask, size=2000.0):
+    """A recorded snapshot AND its book. 14A refuses to trade a market with no recorded depth, so a
+    quote without levels is not a tradeable quote. `size` is deliberately deep: these tests are
+    about settlement, not about the fill model."""
+    clock.advance(seconds=1)                    # each quote is its own moment, so books never tie
     at = clock().isoformat(timespec="seconds")
     with store._db() as db:
         db.execute("INSERT INTO runs(observed_at, source) VALUES(?, 'scan')", (at,))
-        db.execute("INSERT INTO snapshots(run_id, observed_at, token_id, market_id, best_bid, best_ask, mid,"
-                   " spread, flags, usable) VALUES((SELECT MAX(run_id) FROM runs),?,?,?,?,?,?,?,'[]',1)",
-                   (at, YES, MKT, bid, ask, (bid + ask) / 2, ask - bid))
+        cur = db.execute("INSERT INTO snapshots(run_id, observed_at, token_id, market_id, best_bid, best_ask, mid,"
+                         " spread, flags, usable) VALUES((SELECT MAX(run_id) FROM runs),?,?,?,?,?,?,?,'[]',1)",
+                         (at, YES, MKT, bid, ask, (bid + ask) / 2, ask - bid))
+        db.executemany("INSERT INTO book_levels(snapshot_id, side, level, price, size, observed_at)"
+                       " VALUES(?,?,?,?,?,?)",
+                       [(cur.lastrowid, "bid", 0, bid, size, at), (cur.lastrowid, "ask", 0, ask, size, at)])
 
 
 def opened(engine, target=0.30):
@@ -87,7 +98,7 @@ def test_a_position_already_at_the_ceiling_is_left_to_resolve(rig):
 
 def test_settle_hold_above_none_always_exits(rig):
     store, engine, clock = rig
-    engine.settings = PaperSettings(settle_hold_above=None)
+    engine.settings = PaperSettings(settle_hold_above=None, costs=CostSettings(enabled=False))
     seed(store, clock, end_date=(clock() + timedelta(minutes=20)).isoformat())
     opened(engine, target=None)
     quote(store, clock, 0.98, 0.99)
@@ -96,7 +107,7 @@ def test_settle_hold_above_none_always_exits(rig):
 
 def test_settlement_off_holds_to_resolution(rig):
     store, engine, clock = rig
-    engine.settings = PaperSettings(settle_before_minutes=0)
+    engine.settings = PaperSettings(settle_before_minutes=0, costs=CostSettings(enabled=False))
     seed(store, clock, end_date=(clock() + timedelta(minutes=5)).isoformat())
     opened(engine)
     quote(store, clock, 0.60, 0.62)

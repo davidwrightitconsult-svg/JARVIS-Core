@@ -222,3 +222,58 @@ def test_config_rejects_unsafe_values():
                 dict(ping_interval_s=30), dict(max_spread=0)):
         with pytest.raises(ValueError):
             TriggerConfig(**bad)
+
+
+# --------------------------------------------------------------------------- 14A: live depth
+def test_a_book_event_carries_its_levels_best_first():
+    """14A prices fills by walking a book. The stream's own book is fresher than any snapshot, so
+    it has to arrive with the quote, sorted the way the fill model expects."""
+    async def t():
+        quotes = []
+        r = Rig([book(A1, 0.50, 0.52)], on_quote=lambda *a: quotes.append(a))
+        await r.run()
+        levels = quotes[-1][5]
+        assert [p for p, _ in levels["bids"]] == [0.50, 0.49], "bids descend"
+        assert [p for p, _ in levels["asks"]] == [0.52, 0.53], "asks ascend"
+    go(t())
+
+
+def test_a_price_change_is_folded_into_the_book_it_already_holds():
+    """price_change reports the new size resting at one price, so the book stays current between
+    full snapshots instead of being thrown away on every tick."""
+    async def t():
+        quotes = []
+        # The 0.52 ask is taken down to 2 shares. Both reported tops are unchanged.
+        change = {"event_type": "price_change", "market": "0xM", "timestamp": "1",
+                  "price_changes": [{"asset_id": A1, "price": "0.52", "size": "2", "side": "SELL",
+                                     "best_bid": "0.50", "best_ask": "0.52"}]}
+        r = Rig([book(A1, 0.50, 0.52), change], on_quote=lambda *a: quotes.append(a))
+        await r.run()
+        assert quotes[-1][5]["asks"] == [[0.52, 2.0], [0.53, 5.0]]
+        assert r.agent.stats.book_desync == 0
+    go(t())
+
+
+def test_a_level_cancelled_to_zero_leaves_the_book():
+    async def t():
+        quotes = []
+        change = {"event_type": "price_change", "market": "0xM", "timestamp": "1",
+                  "price_changes": [{"asset_id": A1, "price": "0.52", "size": "0", "side": "SELL",
+                                     "best_bid": "0.50", "best_ask": "0.53"}]}
+        r = Rig([book(A1, 0.50, 0.52), change], on_quote=lambda *a: quotes.append(a))
+        await r.run()
+        assert quotes[-1][5]["asks"] == [[0.53, 5.0]]
+    go(t())
+
+
+def test_a_book_that_disagrees_with_the_reported_top_is_dropped():
+    """If folding the change in leaves a top that the same frame contradicts, a change was missed.
+    Pricing a fill against a book known to be wrong is worse than having no depth at all."""
+    async def t():
+        quotes = []
+        r = Rig([book(A1, 0.50, 0.52), pc(A1, 0.53, 0.55)], on_quote=lambda *a: quotes.append(a))
+        await r.run()
+        assert quotes[0][5] is not None
+        assert quotes[-1][5] is None
+        assert r.agent.stats.book_desync == 1
+    go(t())

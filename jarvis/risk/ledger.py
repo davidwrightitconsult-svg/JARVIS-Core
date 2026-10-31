@@ -121,15 +121,89 @@ class PaperLedger:
             return self._row(db, cur.lastrowid)
 
     def open_checked(self, governor, proposal, price: float, prices: dict[int, float] | None = None,
-                     instrument: str = "", label: str = "") -> tuple[dict[str, Any], dict[str, Any] | None]:
+                     instrument: str = "", label: str = "",
+                     price_for: Callable[[float], float | None] | None = None
+                     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """10C: the one safe way in. The governor's decision and the opening happen under a single
         lock, so two proposals arriving together cannot both be sized against the same room.
-        Returns (decision, position); the position is None when the governor refused."""
+        Returns (decision, position); the position is None when the governor refused.
+
+        14A: `price_for` prices the fill against the stake the governor APPROVED, which may be
+        smaller than the one proposed. A smaller order walks less of the book, so pricing it at the
+        proposed size would overstate the cost. Returning None means the book could not fill it."""
         with self._entry:
             decision = governor.evaluate(proposal, self.portfolio(prices))
             if decision["verdict"] not in (APPROVED, REDUCED):
                 return decision, None
-            return decision, self.open(decision, price, instrument, label)
+            fill = price_for(float(decision["approved_stake"])) if price_for else price
+            if fill is None:
+                return {**decision, "reason": "no depth: the recorded book could not fill the approved stake"}, None
+            return decision, self.open(decision, fill, instrument, label)
+
+    def open_legs_checked(self, governor, proposal, legs_for: Callable[[float], list[dict[str, Any]] | None],
+                          prices: dict[int, float] | None = None
+                          ) -> tuple[dict[str, Any], list[dict[str, Any]] | None]:
+        """15: open SEVERAL positions together, or none of them.
+
+        An arbitrage is only riskless as a whole. Opening one leg and failing to open the other
+        leaves a naked directional bet, which is the opposite of what was approved. So the legs are
+        priced against the stake the governor approved, checked against cash as a group, and
+        inserted in one transaction: any failure rolls all of them back.
+
+        `legs_for(approved_stake)` returns [{stake, price, instrument, label, units?}, ...] whose
+        stakes sum to no more than the approved stake, or None if the books could not fill the
+        group. `units` is given where the share count is the thing that must be exact -- an
+        arbitrage pair is equal shares on both legs, and re-deriving them from a rounded price
+        would leave the two legs fractionally unequal, which is a small naked bet."""
+        with self._entry:
+            decision = governor.evaluate(proposal, self.portfolio(prices))
+            if decision["verdict"] not in (APPROVED, REDUCED):
+                return decision, None
+            legs = legs_for(float(decision["approved_stake"]))
+            if not legs:
+                return {**decision, "reason": "no depth: the recorded books could not fill every leg"}, None
+            return decision, self.open_legs(decision, legs)
+
+    def open_legs(self, decision: dict[str, Any], legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """All the legs or none. Validation happens before the first INSERT, and the single
+        transaction means a failure part-way through leaves no position behind."""
+        if decision.get("verdict") not in (APPROVED, REDUCED):
+            raise LedgerError(f"the governor did not approve this ({decision.get('verdict')}: {decision.get('reason')})")
+        if str(decision.get("mode", "")).upper() != "PAPER":
+            raise LedgerError("the ledger holds paper positions only")
+        if decision.get("decision_id") is None:
+            raise LedgerError("a dry-run decision cannot open a position (it was not recorded)")
+        if not legs:
+            raise LedgerError("a multi-leg open needs at least one leg")
+        for leg in legs:
+            if not all(isinstance(leg.get(k), (int, float)) and math.isfinite(leg[k]) and leg[k] > 0
+                       for k in ("stake", "price")):
+                raise LedgerError("every leg needs a positive finite stake and price")
+        total = sum(float(leg["stake"]) for leg in legs)
+        approved = float(decision["approved_stake"])
+        if total > approved + 1e-6:
+            raise LedgerError(f"the legs total ${total:.2f}, more than the ${approved:.2f} approved")
+        with self._lock, self._db() as db:
+            if db.execute("SELECT 1 FROM paper_positions WHERE decision_id=?", (decision["decision_id"],)).fetchone():
+                raise LedgerError("this decision has already been used to open a position")
+            cash = self._get(db, "cash")
+            if total > cash + 1e-9:
+                raise LedgerError(f"not enough paper cash (${cash:.2f}) for ${total:.2f} of legs")
+            now = self.clock().isoformat(timespec="seconds")
+            ids = []
+            for leg in legs:
+                stake, price = float(leg["stake"]), float(leg["price"])
+                cur = db.execute(
+                    "INSERT INTO paper_positions(opened_at, strategy, market_id, instrument, venue, label, stake,"
+                    " entry_price, units, decision_id, status) VALUES(?,?,?,?,?,?,?,?,?,?,'OPEN')",
+                    (now, str(decision["strategy"])[:80], str(decision["market_id"])[:80],
+                     str(leg.get("instrument", ""))[:120], str(decision.get("venue", ""))[:40],
+                     str(leg.get("label", ""))[:120], round(stake, 6), price,
+                     round(float(leg["units"]) if leg.get("units") else stake / price, 6),
+                     decision["decision_id"]))
+                ids.append(cur.lastrowid)
+            self._set(db, "cash", round(cash - total, 6))
+            return [self._row(db, i) for i in ids]
 
     def close(self, position_id: int, exit_price: float, reason: str = "") -> dict[str, Any]:
         if not (isinstance(exit_price, (int, float)) and math.isfinite(exit_price) and exit_price >= 0):

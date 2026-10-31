@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
+from jarvis.paper.costs import CostSettings
 from jarvis.paper import Order, PaperEngine, PaperSettings
 from jarvis.risk import PaperLedger, RiskGovernor, RiskSettings, RiskState
 
@@ -55,7 +56,9 @@ def rig(tmp_path):
     governor = RiskGovernor(RiskSettings(), state, lambda: GATE, clock)
     ledger = PaperLedger(tmp_path / "r.db", 1000.0, clock)
     quotes = Quotes(clock)
-    return PaperEngine(governor, ledger, quotes, PaperSettings(), clock=clock), quotes, clock, state, ledger
+    return PaperEngine(governor, ledger, # 14B charges a taker fee on every fill. These tests are about the engine rules, so fees are off here:
+    # otherwise every expected price would carry an unrelated term. See test_paper_costs.py.
+    quotes, PaperSettings(costs=CostSettings(enabled=False)), clock=clock), quotes, clock, state, ledger
 
 
 def order(**kw):
@@ -171,7 +174,7 @@ def test_report_by_strategy_measures_the_real_spread(rig):
     assert rows["S"]["wins"] == 2 and rows["S"]["pnl"] == round(2 * 20 * 0.06 - 20 * 0.10, 2)
     assert rep["last_tick"]["closed"][0]["reason"] == "stop"
     with pytest.raises(ValueError):
-        PaperSettings(max_spread=0.5)
+        PaperSettings(max_spread=0.5, costs=CostSettings(enabled=False))
 
 
 def test_app_wiring_is_read_only(tmp_path, monkeypatch):
@@ -179,7 +182,7 @@ def test_app_wiring_is_read_only(tmp_path, monkeypatch):
     with TestClient(main.app) as c:
         assert main.paper_engine is not None and main.paper_engine.tick in main.poly.observers
         p = c.get("/api/paper").json()
-        assert p["paper_version"] == "12C.1" and p["mode"] == "PAPER" and p["positions"] == [] and p["trades"] == []
+        assert p["paper_version"] == "14B.1" and p["mode"] == "PAPER" and p["positions"] == [] and p["trades"] == []
         assert p["live_trading"] == "LOCKED" and c.post("/api/paper", json={}).status_code == 405
         d = c.get("/api/dashboard").json()
         assert d["paper"]["open"] == 0 and d["system"]["components"]["paper"] == "READY"

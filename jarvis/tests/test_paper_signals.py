@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from jarvis.market.store import MarketStore
+from jarvis.paper.costs import CostSettings
 from jarvis.paper import PaperEngine, PaperSettings, SignalTrader
 from jarvis.risk import PaperLedger, RiskGovernor, RiskSettings, RiskState
 
@@ -28,13 +29,20 @@ def rig(tmp_path):
                        [(YES, MKT, "Yes"), (NO, MKT, "No")])
         db.execute("INSERT INTO runs(observed_at, source) VALUES(?, 'scan')", (at,))
         for tok, bid, ask in ((YES, 0.48, 0.50), (NO, 0.49, 0.51)):
-            db.execute("INSERT INTO snapshots(run_id, observed_at, token_id, market_id, best_bid, best_ask,"
-                       " mid, spread, flags, usable) VALUES(1,?,?,?,?,?,?,?,'[]',1)",
-                       (at, tok, MKT, bid, ask, (bid + ask) / 2, ask - bid))
+            cur = db.execute("INSERT INTO snapshots(run_id, observed_at, token_id, market_id, best_bid, best_ask,"
+                             " mid, spread, flags, usable) VALUES(1,?,?,?,?,?,?,?,'[]',1)",
+                             (at, tok, MKT, bid, ask, (bid + ask) / 2, ask - bid))
+            # 14A: a market with no recorded book is not tradeable. Deep levels here keep these
+            # tests about signal selection rather than about the fill model.
+            db.executemany("INSERT INTO book_levels(snapshot_id, side, level, price, size, observed_at)"
+                           " VALUES(?,?,?,?,?,?)",
+                           [(cur.lastrowid, "bid", 0, bid, 2000.0, at), (cur.lastrowid, "ask", 0, ask, 2000.0, at)])
     state = RiskState(tmp_path / "risk.db")
     gate = {"approved_for_paper": ["MOMENTUM"], "forward_test": ["MEAN_REVERSION"], "live_approved": []}
     engine = PaperEngine(RiskGovernor(RiskSettings(), state, lambda: gate), PaperLedger(tmp_path / "risk.db", 1000.0),
-                         store, PaperSettings())
+                         # 14B charges a taker fee on every fill. These tests are about signal trading, so fees are off here:
+    # otherwise every expected price would carry an unrelated term. See test_paper_costs.py.
+    store, PaperSettings(costs=CostSettings(enabled=False)))
     return store, engine, gate
 
 
@@ -142,7 +150,7 @@ def test_down_is_skipped_when_the_market_is_not_binary(rig):
 
 def test_a_refusal_is_recorded_and_not_retried(rig):
     store, engine, gate = rig
-    engine.settings = PaperSettings(max_spread=0.001)      # the engine will refuse: spread too wide
+    engine.settings = PaperSettings(max_spread=0.001, costs=CostSettings(enabled=False))      # the engine will refuse: spread too wide
     signal(store)
     out = trader(engine, store, gate).on_run()
     assert out["refused"] == 1 and out["placed"] == 0

@@ -307,7 +307,10 @@ class MarketStore:
         with self._db() as db:
             snap = db.execute(
                 "SELECT snapshot_id, observed_at FROM snapshots WHERE token_id=?"
-                + (" AND observed_at=?" if observed_at else "") + " ORDER BY observed_at DESC LIMIT 1",
+                + (" AND observed_at=?" if observed_at else "")
+                # snapshot_id breaks the tie: two runs can share a timestamp, and the book of the
+                # LATEST of them is the one that belongs with the quote being filled.
+                + " ORDER BY observed_at DESC, snapshot_id DESC LIMIT 1",
                 (token_id, observed_at) if observed_at else (token_id,)).fetchone()
             if snap is None:
                 return {"token_id": token_id, "observed_at": None, "bids": [], "asks": []}
@@ -848,6 +851,64 @@ class MarketStore:
                 " GROUP BY s.run_id, s.market_id HAVING COUNT(*)=2 AND MIN(s.usable)=1"
                 " AND COUNT(s.best_ask)=2 AND COUNT(s.best_bid)=2 ORDER BY s.run_id", (since,)).fetchall()
         return [dict(r) for r in rows]
+
+    def arbitrage_candidates(self, max_age_minutes: float = 15.0, limit: int = 200,
+                             as_of: str | None = None) -> list[dict[str, Any]]:
+        """15: two-outcome markets whose two best asks, in FRIDAY's most recent snapshot of each,
+        sum to less than $1. Buying both locks the difference whatever the outcome.
+
+        Only the LATEST snapshot per token is considered: an arbitrage that existed an hour ago is
+        not one that can be traded now. Returns both legs with the snapshot each ask came from, so
+        the real depth behind it can be read."""
+        # `as_of` rather than the wall clock: the engine is clock-injected everywhere else, and a
+        # scan is always judged against the moment it is being acted on.
+        base = _now() if not as_of else datetime.fromisoformat(str(as_of).replace("Z", "+00:00"))
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
+        since = (base - timedelta(minutes=float(max_age_minutes))).isoformat(timespec="seconds")
+        with self._db() as db:
+            rows = db.execute(
+                "WITH latest AS ("
+                "  SELECT s.* FROM snapshots s"
+                "  JOIN (SELECT token_id, MAX(observed_at) at, MAX(snapshot_id) sid FROM snapshots"
+                "        WHERE observed_at>=? GROUP BY token_id) l"
+                "    ON l.token_id=s.token_id AND l.sid=s.snapshot_id"
+                "  WHERE s.usable=1 AND s.best_ask IS NOT NULL AND s.best_bid IS NOT NULL)"
+                " SELECT market_id, SUM(best_ask) ask_sum, COUNT(*) legs,"
+                "        MIN(observed_at) observed_at,"
+                "        GROUP_CONCAT(token_id) tokens, GROUP_CONCAT(snapshot_id) snapshot_ids,"
+                "        GROUP_CONCAT(best_ask) asks"
+                " FROM latest GROUP BY market_id"
+                " HAVING legs=2 AND SUM(best_ask) < 1.0"
+                " ORDER BY SUM(best_ask) ASC LIMIT ?", (since, max(1, min(int(limit), 1000)))).fetchall()
+        out = []
+        for r in rows:
+            tokens = str(r["tokens"]).split(",")
+            snaps = [int(x) for x in str(r["snapshot_ids"]).split(",")]
+            asks = [float(x) for x in str(r["asks"]).split(",")]
+            if len(tokens) != 2 or len(snaps) != 2 or len(asks) != 2:
+                continue
+            with self._db() as db:
+                m = db.execute("SELECT question, end_date, neg_risk FROM markets WHERE market_id=?",
+                               (r["market_id"],)).fetchone()
+            out.append({"market_id": r["market_id"], "ask_sum": round(float(r["ask_sum"]), 6),
+                        "observed_at": r["observed_at"], "question": m["question"] if m else None,
+                        "end_date": m["end_date"] if m else None, "neg_risk": m["neg_risk"] if m else None,
+                        "legs": [{"token_id": tokens[i], "snapshot_id": snaps[i], "best_ask": asks[i]}
+                                 for i in (0, 1)]})
+        return out
+
+    def levels_for_snapshot(self, snapshot_id: int) -> dict[str, Any]:
+        """The recorded book of one specific snapshot, best first. 15 needs the book that belongs to
+        a named ask rather than the newest book for the token."""
+        with self._db() as db:
+            rows = db.execute("SELECT side, level, price, size FROM book_levels WHERE snapshot_id=?"
+                              " ORDER BY side, level", (int(snapshot_id),)).fetchall()
+        bids = sorted([[float(r["price"]), float(r["size"])] for r in rows if r["side"] == "bid"],
+                      key=lambda lv: -lv[0])
+        asks = sorted([[float(r["price"]), float(r["size"])] for r in rows if r["side"] == "ask"],
+                      key=lambda lv: lv[0])
+        return {"bids": bids, "asks": asks}
 
     def snapshot_span(self) -> tuple[str, str] | None:
         """(first, last) observation time FRIDAY has recorded, or None."""

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
+from jarvis.paper.costs import CostSettings
 from jarvis.paper import BollingerResting, Order, PaperEngine, PaperSettings
 from jarvis.paper import sources
 from jarvis.risk import PaperLedger, RiskGovernor, RiskSettings, RiskState
@@ -73,7 +74,9 @@ def rig(tmp_path):
     box = {}
     governor = RiskGovernor(RiskSettings(), state, lambda: {"approved_for_paper": [], "forward_test": [
         e["strategy"] for e in [box["src"].gate_entry()] if e and e["status"] == "FORWARD_TEST"], "live_approved": []}, clock)
-    engine = PaperEngine(governor, ledger, market, PaperSettings(), clock=clock)
+    engine = PaperEngine(governor, ledger, # 14B charges a taker fee on every fill. These tests are about resting orders, so fees are off here:
+    # otherwise every expected price would carry an unrelated term. See test_paper_costs.py.
+    market, PaperSettings(costs=CostSettings(enabled=False)), clock=clock)
     box["src"] = BollingerResting(engine, market, clock=clock)
     return engine, box["src"], market, clock, state, ledger
 
@@ -241,9 +244,11 @@ def test_the_gate_lists_forward_tests_but_they_cannot_approve_themselves(tmp_pat
 def test_app_runs_the_forward_test_after_each_scan(monkeypatch):
     from jarvis.app import main
     with TestClient(main.app) as c:
-        # exits and fills first, then the forward test, then the 13C gate-allowed signals
-        assert main.paper_source is not None and main.poly.observers[-3:] == [
-            main.paper_engine.tick, main.paper_source.on_run, main.signal_trader.on_run]
+        # exits and fills first, then the forward test, then the 13C gate-allowed signals, then
+        # the 15 arbitrage pairs. Fills and exits must run before anything opens a new position.
+        assert main.paper_source is not None and main.poly.observers[-4:] == [
+            main.paper_engine.tick, main.paper_source.on_run, main.signal_trader.on_run,
+            main.pair_trader.on_run]
         g = c.get("/api/lab/gate").json()
         assert NAME in g["forward_test"] and g["live_approved"] == []
         p = c.get("/api/paper").json()
