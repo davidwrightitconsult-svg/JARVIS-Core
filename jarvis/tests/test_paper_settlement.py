@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from jarvis.market.store import MarketStore
+from jarvis.paper.costs import CostSettings
 from jarvis.paper import Order, PaperEngine, PaperSettings
 from jarvis.risk import PaperLedger, RiskGovernor, RiskSettings, RiskState
 from jarvis.tests.test_trigger_agent import FakeWS, connector
@@ -32,7 +33,10 @@ def rig(tmp_path):
     store = MarketStore(tmp_path / "market.db")
     state = RiskState(tmp_path / "risk.db")
     engine = PaperEngine(RiskGovernor(RiskSettings(), state, lambda: GATE, clock),
-                         PaperLedger(tmp_path / "risk.db", 1000.0, clock), store, PaperSettings(), clock=clock)
+                         PaperLedger(tmp_path / "risk.db", 1000.0, clock), # 14B charges a taker fee on every fill. These tests are about settlement, so fees are off here:
+    # otherwise every expected price would carry an unrelated term. See test_paper_costs.py.
+    store,
+                         PaperSettings(costs=CostSettings(enabled=False)), clock=clock)
     return store, engine, clock
 
 
@@ -94,7 +98,7 @@ def test_a_position_already_at_the_ceiling_is_left_to_resolve(rig):
 
 def test_settle_hold_above_none_always_exits(rig):
     store, engine, clock = rig
-    engine.settings = PaperSettings(settle_hold_above=None)
+    engine.settings = PaperSettings(settle_hold_above=None, costs=CostSettings(enabled=False))
     seed(store, clock, end_date=(clock() + timedelta(minutes=20)).isoformat())
     opened(engine, target=None)
     quote(store, clock, 0.98, 0.99)
@@ -103,7 +107,7 @@ def test_settle_hold_above_none_always_exits(rig):
 
 def test_settlement_off_holds_to_resolution(rig):
     store, engine, clock = rig
-    engine.settings = PaperSettings(settle_before_minutes=0)
+    engine.settings = PaperSettings(settle_before_minutes=0, costs=CostSettings(enabled=False))
     seed(store, clock, end_date=(clock() + timedelta(minutes=5)).isoformat())
     opened(engine)
     quote(store, clock, 0.60, 0.62)

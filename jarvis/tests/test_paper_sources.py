@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
+from jarvis.paper.costs import CostSettings
 from jarvis.paper import BollingerResting, Order, PaperEngine, PaperSettings
 from jarvis.paper import sources
 from jarvis.risk import PaperLedger, RiskGovernor, RiskSettings, RiskState
@@ -73,7 +74,9 @@ def rig(tmp_path):
     box = {}
     governor = RiskGovernor(RiskSettings(), state, lambda: {"approved_for_paper": [], "forward_test": [
         e["strategy"] for e in [box["src"].gate_entry()] if e and e["status"] == "FORWARD_TEST"], "live_approved": []}, clock)
-    engine = PaperEngine(governor, ledger, market, PaperSettings(), clock=clock)
+    engine = PaperEngine(governor, ledger, # 14B charges a taker fee on every fill. These tests are about resting orders, so fees are off here:
+    # otherwise every expected price would carry an unrelated term. See test_paper_costs.py.
+    market, PaperSettings(costs=CostSettings(enabled=False)), clock=clock)
     box["src"] = BollingerResting(engine, market, clock=clock)
     return engine, box["src"], market, clock, state, ledger
 

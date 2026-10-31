@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from jarvis.market.store import MarketStore
+from jarvis.paper.costs import CostSettings
 from jarvis.paper import Order, PaperEngine, PaperSettings
 from jarvis.paper.fills import EMPTY, buy_for_stake, capacity, sell_shares
 from jarvis.risk import PaperLedger, RiskGovernor, RiskSettings, RiskState
@@ -92,7 +93,10 @@ def rig(tmp_path):
     clock = Clock()
     store = MarketStore(tmp_path / "market.db")
     engine = PaperEngine(RiskGovernor(RiskSettings(), RiskState(tmp_path / "risk.db"), lambda: GATE, clock),
-                         PaperLedger(tmp_path / "risk.db", 1000.0, clock), store, PaperSettings(), clock=clock)
+                         PaperLedger(tmp_path / "risk.db", 1000.0, clock), # 14B charges a taker fee on every fill. These tests are about the fill model, so fees are off here:
+    # otherwise every expected price would carry an unrelated term. See test_paper_costs.py.
+    store,
+                         PaperSettings(costs=CostSettings(enabled=False)), clock=clock)
     at = clock().isoformat(timespec="seconds")
     with store._db() as db:
         db.execute("INSERT OR REPLACE INTO markets(market_id, question, end_date, first_seen, last_seen)"
@@ -211,7 +215,7 @@ def test_depth_aware_can_be_turned_off_and_the_old_model_returns(tmp_path):
     store = MarketStore(tmp_path / "market.db")
     engine = PaperEngine(RiskGovernor(RiskSettings(), RiskState(tmp_path / "risk.db"), lambda: GATE, clock),
                          PaperLedger(tmp_path / "risk.db", 1000.0, clock), store,
-                         PaperSettings(depth_aware=False), clock=clock)
+                         PaperSettings(depth_aware=False, costs=CostSettings(enabled=False)), clock=clock)
     at = clock().isoformat(timespec="seconds")
     with store._db() as db:
         db.execute("INSERT OR REPLACE INTO markets(market_id, question, end_date, first_seen, last_seen)"

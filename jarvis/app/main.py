@@ -235,6 +235,7 @@ def _build_paper() -> None:
         state.set_component("paper", "DISABLED")
         return
     from jarvis.paper import PaperEngine, PaperSettings
+    from jarvis.paper.costs import CostSettings
 
     def f(name, default):
         raw = os.getenv(name, "").strip()
@@ -249,7 +250,11 @@ def _build_paper() -> None:
                                                     float(hold) if hold else d.settle_hold_above),
                                  depth_aware=_env_on("JARVIS_PAPER_DEPTH_AWARE", True),
                                  max_slippage=f("JARVIS_PAPER_MAX_SLIPPAGE", d.max_slippage),
-                                 min_depth_usd=f("JARVIS_PAPER_MIN_DEPTH_USD", d.min_depth_usd))
+                                 min_depth_usd=f("JARVIS_PAPER_MIN_DEPTH_USD", d.min_depth_usd),
+                                 costs=CostSettings(
+                                     enabled=_env_on("JARVIS_PAPER_FEES", True),
+                                     fee_multiplier=f("JARVIS_PAPER_FEE_MULTIPLIER", d.costs.fee_multiplier),
+                                     gas_usd_per_fill=f("JARVIS_PAPER_GAS_USD", d.costs.gas_usd_per_fill)))
     except ValueError:
         settings = d
     paper_engine = PaperEngine(risk_governor, paper_ledger, quant.store, settings,
@@ -738,6 +743,7 @@ def paper_view(trades: int = 50):
                   "expires_at": plans.get(p["position_id"], {}).get("expires_at")} for p in paper_ledger.positions("OPEN")]
     return {**paper_engine.report(), "positions": open_rows, "trades": paper_engine.trades(max(1, min(int(trades), 500))),
             "resting": paper_engine.resting("PENDING", 100), "settlement": paper_engine.settlement_report(),
+            "capacity": paper_engine.capacity_report(),
             "signal_trading": signal_trader.report(100) if signal_trader is not None else {"enabled": False},
             "forward_tests": [{**paper_source.standing(), "last_run": paper_source.last}] if paper_source is not None else []}
 

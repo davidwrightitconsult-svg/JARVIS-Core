@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from jarvis.market.store import MarketStore
+from jarvis.paper.costs import CostSettings
 from jarvis.paper import PaperEngine, PaperSettings, SignalTrader
 from jarvis.risk import PaperLedger, RiskGovernor, RiskSettings, RiskState
 
@@ -39,7 +40,9 @@ def rig(tmp_path):
     state = RiskState(tmp_path / "risk.db")
     gate = {"approved_for_paper": ["MOMENTUM"], "forward_test": ["MEAN_REVERSION"], "live_approved": []}
     engine = PaperEngine(RiskGovernor(RiskSettings(), state, lambda: gate), PaperLedger(tmp_path / "risk.db", 1000.0),
-                         store, PaperSettings())
+                         # 14B charges a taker fee on every fill. These tests are about signal trading, so fees are off here:
+    # otherwise every expected price would carry an unrelated term. See test_paper_costs.py.
+    store, PaperSettings(costs=CostSettings(enabled=False)))
     return store, engine, gate
 
 
@@ -147,7 +150,7 @@ def test_down_is_skipped_when_the_market_is_not_binary(rig):
 
 def test_a_refusal_is_recorded_and_not_retried(rig):
     store, engine, gate = rig
-    engine.settings = PaperSettings(max_spread=0.001)      # the engine will refuse: spread too wide
+    engine.settings = PaperSettings(max_spread=0.001, costs=CostSettings(enabled=False))      # the engine will refuse: spread too wide
     signal(store)
     out = trader(engine, store, gate).on_run()
     assert out["refused"] == 1 and out["placed"] == 0
