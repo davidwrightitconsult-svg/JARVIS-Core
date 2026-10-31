@@ -253,10 +253,16 @@ def _build_paper() -> None:
                                  depth_aware=_env_on("JARVIS_PAPER_DEPTH_AWARE", True),
                                  max_slippage=f("JARVIS_PAPER_MAX_SLIPPAGE", d.max_slippage),
                                  min_depth_usd=f("JARVIS_PAPER_MIN_DEPTH_USD", d.min_depth_usd),
+                                 max_round_trip_fraction=(
+                                     None if os.getenv("JARVIS_PAPER_MAX_ROUND_TRIP", "").strip().lower()
+                                     in ("none", "off") else f("JARVIS_PAPER_MAX_ROUND_TRIP",
+                                                               d.max_round_trip_fraction)),
                                  costs=CostSettings(
                                      enabled=_env_on("JARVIS_PAPER_FEES", True),
                                      fee_multiplier=f("JARVIS_PAPER_FEE_MULTIPLIER", d.costs.fee_multiplier),
-                                     gas_usd_per_fill=f("JARVIS_PAPER_GAS_USD", d.costs.gas_usd_per_fill)))
+                                     gas_usd_per_fill=f("JARVIS_PAPER_GAS_USD", d.costs.gas_usd_per_fill),
+                                     maker_rebate_share=f("JARVIS_PAPER_MAKER_REBATE_SHARE",
+                                                          d.costs.maker_rebate_share)))
     except ValueError:
         settings = d
     paper_engine = PaperEngine(risk_governor, paper_ledger, quant.store, settings,

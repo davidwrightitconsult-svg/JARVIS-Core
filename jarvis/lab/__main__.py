@@ -7,6 +7,7 @@ FRIDAY Validation Lab CLI (read-only).
     python -m jarvis.lab inconsistencies [--days 30] [--json]          both outcomes for under $1 (recorded asks)
     python -m jarvis.lab gate [--json]                                 what JARVIS may paper-trade (9C)
     python -m jarvis.lab edge [--days 30] [--json]                      after fees, against a coin flip (16A)
+    python -m jarvis.lab economics [--json]                             what a round trip costs, where (18C)
     python -m jarvis.lab calibrate [--seed 17] [--json]                 can the edge report measure? (17)
     python -m jarvis.lab lifecycle [--json]                             signal -> fill -> exit -> settle (17B)
     python -m jarvis.lab bars [--bar-days 30] [--max-markets 500] [--minutes 60]
@@ -34,7 +35,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m jarvis.lab", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=["backtest", "robustness", "inconsistencies", "gate", "edge",
-                                           "calibrate", "lifecycle", "bars", "bars-status",
+                                           "calibrate", "lifecycle", "economics", "bars", "bars-status",
                                            "book-test", "book-results"])
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--days", type=float, default=30)
@@ -153,6 +154,13 @@ def main(argv=None) -> int:
         from .inconsistency import render_inconsistencies, scan_inconsistencies
         result = scan_inconsistencies(store, days=a.days, fee=settings.edge.fee)
         print(json.dumps(result, indent=2, default=str) if a.json else render_inconsistencies(result))
+        return 0
+    if a.command == "economics":
+        from jarvis.paper.costs import CostSettings
+        from .economics import render as render_econ
+        from .economics import report as econ_report
+        result = econ_report(store, costs=CostSettings())
+        print(json.dumps(result, indent=2, default=str) if a.json else render_econ(result))
         return 0
     if a.command == "edge":
         from jarvis.paper.costs import CostSettings

@@ -12,7 +12,9 @@ import pytest
 from jarvis.market.store import MarketStore
 from jarvis.paper import Order, PaperEngine, PaperSettings
 from jarvis.paper.capacity import replay, report
-from jarvis.paper.costs import TAKER_RATES, UNKNOWN_RATE, CostSettings, cost_of, round_trip_per_share, taker_fee
+from jarvis.paper.costs import (
+    TAKER_RATES, UNKNOWN_RATE, CostSettings, cost_of, round_trip, round_trip_per_share, taker_fee,
+)
 from jarvis.risk import PaperLedger, RiskGovernor, RiskSettings, RiskState
 
 GATE = {"approved_for_paper": ["S"], "forward_test": [], "live_approved": []}
@@ -69,11 +71,57 @@ def test_gas_is_charged_per_fill_when_it_is_configured():
     assert paid.per_share == pytest.approx(paid.total_usd / 100)
 
 
-def test_a_maker_fill_is_only_free_when_the_settings_say_so():
-    """FRIDAY's resting strategies submit at market when they trigger, so they are takers. The flag
-    exists for when a real resting limit order does, and defaults to charging the fee."""
-    assert cost_of(CostSettings(), 100, 0.50, "crypto", maker=True).fee_usd > 0
-    assert cost_of(CostSettings(credit_maker_fills=True), 100, 0.50, "crypto", maker=True).fee_usd == 0.0
+def test_a_maker_fill_pays_no_taker_fee():
+    """18A: a resting order that someone else fills is a maker fill. FRIDAY's `rest()` path fills at
+    its OWN limit price when the market trades through it, which is exactly that -- this was
+    previously documented as the opposite and treated as a taker."""
+    assert cost_of(CostSettings(), 100, 0.50, "crypto", maker=True).fee_usd == 0.0
+    assert cost_of(CostSettings(), 100, 0.50, "crypto", maker=False).fee_usd > 0
+    assert cost_of(CostSettings(credit_maker_fills=False), 100, 0.50, "crypto", maker=True).fee_usd > 0
+
+
+def test_a_rebate_is_not_credited_unless_it_is_asked_for():
+    """Crediting income FRIDAY may not earn is the generous-fill mistake in another costume: the
+    published rebate depends on a monthly volume tier it has no claim to."""
+    assert cost_of(CostSettings(), 100, 0.50, "economy", maker=True).fee_usd == 0.0
+    paid = cost_of(CostSettings(maker_rebate_share=0.25), 100, 0.50, "economy", maker=True)
+    assert paid.fee_usd == pytest.approx(-0.25 * 100 * 0.05 * 0.25)
+    assert paid.total_usd < 0, "a rebate is negative cost"
+
+
+def test_a_maker_entry_is_the_structural_answer_to_the_round_trip():
+    """Resting at the bid instead of crossing saves the spread AND the entry fee. At mid prices in
+    a 0.05 category that is 9% of capital down to 2.6% -- the single largest economic lever here."""
+    taker = round_trip(CostSettings(), 0.48, 0.50, "economy")
+    maker = round_trip(CostSettings(), 0.48, 0.50, "economy", maker_entry=True)
+    assert taker.fraction_of_cost == pytest.approx(0.09, abs=0.002)
+    assert maker.fraction_of_cost == pytest.approx(0.026, abs=0.002)
+    assert maker.spread == 0.0 and maker.entry_fee == 0.0
+    assert maker.exit_fee == taker.exit_fee, "getting out is still a taker fill"
+    # The precise claim: a maker entry rests AT THE BID rather than crossing to the ask.
+    assert maker.cost_basis == 0.48 and taker.cost_basis == 0.50
+
+
+def test_the_round_trip_is_the_spread_once_plus_both_fee_legs():
+    """Buying at the ask and selling at the bid with an unchanged mid loses exactly the spread --
+    once, not twice."""
+    rt = round_trip(CostSettings(enabled=False), 0.48, 0.50, "economy")
+    assert rt.spread == pytest.approx(0.02) and rt.total == pytest.approx(0.02)
+    full = round_trip(CostSettings(), 0.48, 0.50, "economy")
+    assert full.total == pytest.approx(0.02 + taker_fee(1, 0.50, 0.05) + taker_fee(1, 0.48, 0.05))
+
+
+def test_the_round_trip_is_cheap_in_the_tails_and_expensive_in_the_middle():
+    mid = round_trip(CostSettings(), 0.48, 0.50, "economy")
+    tail = round_trip(CostSettings(), 0.88, 0.90, "economy")
+    assert tail.fraction_of_cost < mid.fraction_of_cost / 2
+    free = round_trip(CostSettings(), 0.48, 0.50, "geopolitics")
+    assert free.total == pytest.approx(0.02), "no fee: the spread is the whole cost"
+
+
+def test_a_nonsense_quote_has_no_round_trip():
+    for bid, ask in ((0.5, 0.4), (0.0, 0.5), (0.5, 1.0), (None, 0.5), (float("nan"), 0.5)):
+        assert round_trip(CostSettings(), bid, ask, "economy") is None
 
 
 def test_the_round_trip_cost_is_the_number_an_edge_must_beat():

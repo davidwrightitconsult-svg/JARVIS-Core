@@ -68,10 +68,16 @@ class CostSettings:
     fee_multiplier: float = 1.0
     # 0 matches the relayer sponsoring gas for proxy wallets. Set it to price that assumption away.
     gas_usd_per_fill: float = 0.0
-    # Resting orders that get filled are maker fills, which pay no fee. FRIDAY's resting strategies
-    # submit at market when they trigger, so they are takers; this stays False until a real resting
-    # limit order exists on the exchange.
-    credit_maker_fills: bool = False
+    # 18A: a resting order that someone else fills is a MAKER fill. It pays no taker fee and may
+    # earn a rebate. FRIDAY's `rest()` path fills at its OWN limit price when the market trades
+    # through it, which is a maker fill -- this was previously documented as the opposite, and the
+    # maker treatment was happening by accident rather than by design.
+    credit_maker_fills: bool = True
+    # The published maker rebate is a share of the taker fees collected in that market (reported at
+    # 15-25% by category). It is NOT modelled by default: a rebate depends on a monthly volume tier
+    # FRIDAY has no claim to, and crediting income we may not earn is the generous-fill mistake in
+    # another costume. Set it only to ask what a rebate would be worth.
+    maker_rebate_share: float = 0.0
 
     def rate_for(self, category: str | None) -> float:
         if not self.enabled:
@@ -120,19 +126,74 @@ def taker_fee(shares: float, price: float, rate: float) -> float:
 
 def cost_of(settings: CostSettings, shares: float, price: float, category: str | None,
             maker: bool = False) -> Cost:
-    """The cost of one fill. `maker` only matters if the settings credit maker fills."""
+    """The cost of one fill. A maker fill pays no taker fee, and may be credited a rebate if the
+    settings model one (they do not by default)."""
     if not settings.enabled or not isinstance(shares, (int, float)) or not math.isfinite(shares) or shares <= 0:
         return FREE
-    rate = 0.0 if (maker and settings.credit_maker_fills) else settings.rate_for(category)
     gas = max(0.0, float(settings.gas_usd_per_fill))
+    if maker and settings.credit_maker_fills:
+        # A rebate is negative cost: a share of the taker fee that would have been charged.
+        share = max(0.0, min(1.0, float(settings.maker_rebate_share)))
+        rebate = taker_fee(shares, price, settings.rate_for(category)) * share
+        return Cost(fee_usd=(round(-rebate, 8) if rebate else 0.0), gas_usd=gas, rate=0.0,
+                    category=str(category or "unknown"), shares=float(shares))
+    rate = settings.rate_for(category)
     return Cost(fee_usd=taker_fee(shares, price, rate), gas_usd=gas, rate=rate,
                 category=str(category or "unknown"), shares=float(shares))
 
 
 def round_trip_per_share(settings: CostSettings, price: float, category: str | None) -> float:
-    """What it costs, per share, to buy at `price` and sell again at the same price. The number an
-    edge has to beat before it is an edge at all."""
+    """The FEE half of a round trip, per share: buy at `price`, sell again at the same price. This
+    ignores the spread, which `round_trip` below does not."""
     rate = settings.rate_for(category)
     one = taker_fee(1.0, price, rate)
     gas = max(0.0, float(settings.gas_usd_per_fill))
     return round(2.0 * one + 2.0 * gas, 8)
+
+
+@dataclass(frozen=True)
+class RoundTrip:
+    """What it costs, per share, to get into a position and back out of it again.
+
+    This is the number every strategy has to beat, and it is the reason Phase 17's oracle lost
+    money while seeing the future: a 2c spread and a 0.05 fee category cost about 4.5c a share at
+    mid prices, and an hourly move does not clear that often enough.
+
+    `fraction_of_cost` is the same figure as a share of the capital committed, which is the form
+    that compares across prices: 4.5c is 9% of a 50c share and 5% of a 90c one."""
+    spread: float          # paid once: in at the ask, out at the bid
+    entry_fee: float
+    exit_fee: float
+    total: float
+    cost_basis: float      # what one share costs to buy
+    category: str
+
+    @property
+    def fraction_of_cost(self) -> float:
+        return round(self.total / self.cost_basis, 6) if self.cost_basis > 0 else 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"spread": round(self.spread, 6), "entry_fee": round(self.entry_fee, 8),
+                "exit_fee": round(self.exit_fee, 8), "total": round(self.total, 6),
+                "cost_basis": round(self.cost_basis, 6),
+                "fraction_of_cost": self.fraction_of_cost, "category": self.category}
+
+
+def round_trip(settings: CostSettings, bid: float, ask: float, category: str | None,
+               maker_entry: bool = False) -> RoundTrip | None:
+    """In at the ask and out at the bid, with the fee charged on both legs.
+
+    The spread is paid ONCE, not twice: buying at `ask` and selling at `bid` with an unchanged mid
+    loses exactly the spread. A maker entry rests at the bid instead of crossing, which saves both
+    the spread and the entry fee -- the structural reason the maker path matters."""
+    ok = lambda x: isinstance(x, (int, float)) and math.isfinite(x)      # noqa: E731
+    if not (ok(bid) and ok(ask)) or not 0 < bid <= ask < 1:
+        return None
+    entry_price = bid if maker_entry else ask
+    spread = 0.0 if maker_entry else round(ask - bid, 8)
+    entry = cost_of(settings, 1.0, entry_price, category, maker=maker_entry)
+    exit_ = cost_of(settings, 1.0, bid, category)
+    total = spread + max(0.0, entry.fee_usd) + exit_.fee_usd + entry.gas_usd + exit_.gas_usd
+    return RoundTrip(spread=spread, entry_fee=entry.fee_usd, exit_fee=exit_.fee_usd,
+                     total=round(total, 8), cost_basis=entry_price,
+                     category=str(category or "unknown"))
