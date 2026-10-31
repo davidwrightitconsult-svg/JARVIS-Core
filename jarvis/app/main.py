@@ -132,6 +132,7 @@ paper_engine = None             # friday.paper.PaperEngine (Phase 12A)
 paper_source = None             # friday.paper.BollingerResting (Phase 12B forward test)
 signal_trader = None            # jarvis.paper.SignalTrader (Phase 13C: trades what the gate allows)
 pair_trader = None              # jarvis.paper.PairTrader (Phase 15: the riskless pair, both legs or none)
+executor = None                 # jarvis.paper.Executor (Phase 16B: may this trade open NOW, at this size)
 trigger_service = None          # jarvis.trigger.TriggerService (Phase 13A real-time feed; off by default)
 trigger_status: dict = {"enabled": False, "reason": "not started"}
 risk_status: dict = {"enabled": False, "reason": "not started"}
@@ -229,8 +230,8 @@ def _build_risk() -> None:
 def _build_paper() -> None:
     """12A: the paper trading engine. It needs the governor, the ledger and the market store; without
     any of them it stays OFF. It checks its open positions after every stored market scan."""
-    global paper_engine, paper_source, signal_trader, pair_trader
-    paper_engine = paper_source = signal_trader = pair_trader = None
+    global paper_engine, paper_source, signal_trader, pair_trader, executor
+    paper_engine = paper_source = signal_trader = pair_trader = executor = None
     _backtest_cache.pop("gate", None)           # a gate built before this start may list other forward tests
     if risk_governor is None or paper_ledger is None or quant is None:
         state.set_component("paper", "DISABLED")
@@ -261,17 +262,35 @@ def _build_paper() -> None:
     paper_engine = PaperEngine(risk_governor, paper_ledger, quant.store, settings,
                                resolver=getattr(poly, "market_resolutions", None))
     from jarvis.paper import BollingerResting, PairTrader, SignalTrader
-    paper_source = BollingerResting(paper_engine, quant.store, enabled=_env_on("JARVIS_PAPER_BOLLINGER"))
+    from jarvis.paper.executor import ExecutionSettings, Executor
+
+    def edge_report() -> dict:
+        from jarvis.lab.edge import report as _edge
+        return _edge(quant.store.outcomes(days=f("JARVIS_EDGE_WINDOW_DAYS", 30.0)), settings.costs)
+
+    # 16B: the authority between the gate (may this EVER trade) and the Risk Governor (how much).
+    # OFF unless JARVIS_EXECUTE=true: the platform can be fully wired and still not trading.
+    allow = {x.strip() for x in os.getenv("JARVIS_EXECUTE_STRATEGIES", "").split(",") if x.strip()}
+    executor = Executor(
+        gate_provider=lab_gate, edge_provider=edge_report,
+        capacity_provider=lambda: paper_engine.capacity_report(),
+        settings=ExecutionSettings(
+            enabled=_env_on("JARVIS_EXECUTE", False), strategies=frozenset(allow),
+            forward_test_stake=f("JARVIS_EXECUTE_FORWARD_STAKE", 10.0),
+            capacity_fraction=f("JARVIS_EXECUTE_CAPACITY_FRACTION", 0.5)))
+    paper_source = BollingerResting(paper_engine, quant.store, enabled=_env_on("JARVIS_PAPER_BOLLINGER"),
+                                    executor=executor)
     # 13C: the gate could approve a strategy and nothing would trade it. This is the hands for the
     # gate's own judgement; it originates nothing. OFF unless JARVIS_PAPER_SIGNALS=true.
     signal_trader = SignalTrader(paper_engine, quant.store, gate_provider=lab_gate,
                                  enabled=_env_on("JARVIS_PAPER_SIGNALS", False),
-                                 stake=f("JARVIS_PAPER_SIGNAL_STAKE", 20.0))
+                                 stake=f("JARVIS_PAPER_SIGNAL_STAKE", 20.0), executor=executor)
     # 15: the riskless pair the 9C scan has been finding since Phase 9. OFF unless JARVIS_PAPER_ARB=true.
     pair_trader = PairTrader(paper_engine, quant.store, gate_provider=lab_gate,
                              enabled=_env_on("JARVIS_PAPER_ARB", False),
                              budget=f("JARVIS_PAPER_ARB_BUDGET", 50.0),
-                             min_locked_per_pair=f("JARVIS_PAPER_ARB_MIN_LOCKED", 0.005))
+                             min_locked_per_pair=f("JARVIS_PAPER_ARB_MIN_LOCKED", 0.005),
+                             executor=executor)
     if hasattr(poly, "observers"):
         poly.observers.append(paper_engine.tick)          # fills and exits first,
         poly.observers.append(paper_source.on_run)        # then new resting orders,
@@ -752,8 +771,22 @@ def paper_view(trades: int = 50):
             "resting": paper_engine.resting("PENDING", 100), "settlement": paper_engine.settlement_report(),
             "capacity": paper_engine.capacity_report(),
             "arbitrage": pair_trader.report(100) if pair_trader is not None else {"enabled": False},
+            "execution": executor.report() if executor is not None else {"enabled": False},
             "signal_trading": signal_trader.report(100) if signal_trader is not None else {"enabled": False},
             "forward_tests": [{**paper_source.standing(), "last_run": paper_source.last}] if paper_source is not None else []}
+
+
+@app.get("/api/edge")
+def edge_view(days: float = 30.0):
+    """16A: after fees, and against a coin flip on the same signals. Two verdicts, not one:
+    whether a strategy makes money, and whether it knows anything."""
+    if quant is None:
+        raise HTTPException(status_code=503, detail="market data unavailable")
+    from jarvis.lab.edge import report as _edge
+    costs = paper_engine.settings.costs if paper_engine is not None else None
+    out = _edge(quant.store.outcomes(days=max(1.0, min(float(days), 3650.0))), costs)
+    out["execution"] = executor.report() if executor is not None else {"enabled": False}
+    return out
 
 
 @app.get("/api/strategies")

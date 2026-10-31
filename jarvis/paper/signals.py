@@ -52,8 +52,12 @@ class SignalTrader:
     def __init__(self, engine: PaperEngine, store, gate_provider: Callable[[], dict[str, Any]] | None,
                  enabled: bool = True, stake: float = STAKE,
                  max_signal_age_minutes: float = MAX_SIGNAL_AGE_MINUTES,
+                 executor: Any = None,
                  clock: Callable[[], datetime] | None = None):
         self.engine, self.store, self.gate_provider = engine, store, gate_provider
+        # 16B: the gate says whether this strategy may EVER trade; the executor says whether it
+        # may trade now, at this size. None means no executor is wired and the gate alone decides.
+        self.executor = executor
         self.enabled, self.stake = bool(enabled), float(stake)
         self.max_signal_age_minutes = float(max_signal_age_minutes)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -144,9 +148,17 @@ class SignalTrader:
                 out["skipped"] += 1
                 self._record(sig, token, "SKIPPED", None, "the signal's horizon has almost run out")
                 continue
+            stake = self.stake
+            if self.executor is not None:
+                v = self.executor.may_open(sig["strategy"], self.stake)
+                if not v.allowed:
+                    out["refused"] += 1
+                    self._record(sig, token, "REFUSED", None, f"executor: {v.reason}")
+                    continue
+                stake = min(self.stake, v.max_stake)
             # No stop and no target: this is the bet the scorecard measured and the gate approved.
             result = self.engine.submit(Order(
-                strategy=sig["strategy"], market_id=str(sig["market_id"]), token_id=token, stake=self.stake,
+                strategy=sig["strategy"], market_id=str(sig["market_id"]), token_id=token, stake=stake,
                 stop=NO_STOP, target=None, max_hold_hours=hold,
                 label=f"{sig['strategy']} {sig['direction']} · signal {sig['signal_id']}"))
             if result["status"] == "OPENED":

@@ -178,7 +178,7 @@ class PairTrader:
     def __init__(self, engine: PaperEngine, store, gate_provider: Callable[[], dict[str, Any]] | None,
                  enabled: bool = False, budget: float = BUDGET,
                  min_locked_per_pair: float = MIN_LOCKED_PER_PAIR, min_pairs: float = MIN_PAIRS,
-                 max_age_minutes: float = MAX_AGE_MINUTES,
+                 max_age_minutes: float = MAX_AGE_MINUTES, executor: Any = None,
                  clock: Callable[[], datetime] | None = None) -> None:
         self.engine, self.store = engine, store
         self.gate_provider = gate_provider
@@ -187,6 +187,7 @@ class PairTrader:
         self.min_locked_per_pair = float(min_locked_per_pair)
         self.min_pairs = float(min_pairs)
         self.max_age_minutes = float(max_age_minutes)
+        self.executor = executor                   # 16B: may this trade open now, at this size?
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.last: dict[str, Any] = {}
         with self.engine._db() as db:
@@ -288,6 +289,14 @@ class PairTrader:
         costs = self.engine.settings.costs
         slip = self.engine.settings.max_slippage
 
+        budget = self.budget
+        if self.executor is not None:
+            v = self.executor.may_open(STRATEGY, self.budget)
+            if not v.allowed:
+                self._refuse(market_id, f"executor: {v.reason}")
+                return {"market_id": market_id, "status": "REFUSED", "reason": f"executor: {v.reason}"}
+            budget = min(self.budget, v.max_stake)
+
         quotes: dict[float, PairQuote] = {}
 
         def legs_for(approved: float) -> list[dict[str, Any]] | None:
@@ -303,7 +312,7 @@ class PairTrader:
                      "units": q.pairs, "instrument": cand["legs"][1]["token_id"], "label": "arb-leg-b"}]
 
         # Refuse before troubling the governor when the gap does not survive fees at any size.
-        probe = price_pair(a_asks, b_asks, self.budget, costs, category, slip, self.min_pairs)
+        probe = price_pair(a_asks, b_asks, budget, costs, category, slip, self.min_pairs)
         if probe is None:
             self._refuse(market_id, f"not enough depth for {self.min_pairs:g} complete pairs")
             return {"market_id": market_id, "status": "REFUSED", "reason": "not enough depth"}
