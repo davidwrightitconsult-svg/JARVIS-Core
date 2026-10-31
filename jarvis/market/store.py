@@ -569,6 +569,17 @@ class MarketStore:
             return db.execute(f"DELETE FROM watchlist WHERE market_id IN ({','.join('?' * len(ids))})",
                               ids).rowcount
 
+    def market_end_dates(self, market_ids: list[str]) -> dict[str, str]:
+        """13B: market_id -> end_date (ISO) for the markets that have one recorded."""
+        ids = [str(m) for m in market_ids][:2000]
+        if not ids:
+            return {}
+        with self._db() as db:
+            rows = db.execute(
+                f"SELECT market_id, end_date FROM markets WHERE end_date IS NOT NULL"
+                f" AND market_id IN ({','.join('?' * len(ids))})", ids).fetchall()
+        return {r["market_id"]: r["end_date"] for r in rows}
+
     def tokens_for_markets(self, market_ids: list[str]) -> dict[str, str]:
         """13A: token_id -> market_id for the outcomes of the given markets (for the real-time feed)."""
         ids = [str(m) for m in market_ids][:2000]

@@ -69,6 +69,7 @@ from jarvis.core.events import Event
 from jarvis.core.health import HealthManager
 from jarvis.core.lifecycle import LifecycleManager
 from jarvis.core.state import StateManager
+from jarvis.app.auth import auth_status, require_token
 from jarvis.hermes import (
     HermesControlError,
     HermesController,
@@ -129,6 +130,7 @@ risk_governor = None            # friday.risk.RiskGovernor (Phase 10A)
 paper_ledger = None             # friday.risk.PaperLedger (Phase 10B)
 paper_engine = None             # friday.paper.PaperEngine (Phase 12A)
 paper_source = None             # friday.paper.BollingerResting (Phase 12B forward test)
+signal_trader = None            # jarvis.paper.SignalTrader (Phase 13C: trades what the gate allows)
 trigger_service = None          # jarvis.trigger.TriggerService (Phase 13A real-time feed; off by default)
 trigger_status: dict = {"enabled": False, "reason": "not started"}
 risk_status: dict = {"enabled": False, "reason": "not started"}
@@ -226,8 +228,8 @@ def _build_risk() -> None:
 def _build_paper() -> None:
     """12A: the paper trading engine. It needs the governor, the ledger and the market store; without
     any of them it stays OFF. It checks its open positions after every stored market scan."""
-    global paper_engine, paper_source
-    paper_engine = paper_source = None
+    global paper_engine, paper_source, signal_trader
+    paper_engine = paper_source = signal_trader = None
     _backtest_cache.pop("gate", None)           # a gate built before this start may list other forward tests
     if risk_governor is None or paper_ledger is None or quant is None:
         state.set_component("paper", "DISABLED")
@@ -239,17 +241,27 @@ def _build_paper() -> None:
         return float(raw) if raw else default
     d = PaperSettings()
     try:
+        hold = os.getenv("JARVIS_PAPER_SETTLE_HOLD_ABOVE", "").strip()
         settings = PaperSettings(max_quote_age_minutes=f("JARVIS_PAPER_MAX_QUOTE_AGE_MINUTES", d.max_quote_age_minutes),
-                                 max_spread=f("JARVIS_PAPER_MAX_SPREAD", d.max_spread))
+                                 max_spread=f("JARVIS_PAPER_MAX_SPREAD", d.max_spread),
+                                 settle_before_minutes=f("JARVIS_PAPER_SETTLE_BEFORE_MINUTES", d.settle_before_minutes),
+                                 settle_hold_above=(None if hold.lower() in ("none", "off") else
+                                                    float(hold) if hold else d.settle_hold_above))
     except ValueError:
         settings = d
     paper_engine = PaperEngine(risk_governor, paper_ledger, quant.store, settings,
                                resolver=getattr(poly, "market_resolutions", None))
-    from jarvis.paper import BollingerResting
+    from jarvis.paper import BollingerResting, SignalTrader
     paper_source = BollingerResting(paper_engine, quant.store, enabled=_env_on("JARVIS_PAPER_BOLLINGER"))
+    # 13C: the gate could approve a strategy and nothing would trade it. This is the hands for the
+    # gate's own judgement; it originates nothing. OFF unless JARVIS_PAPER_SIGNALS=true.
+    signal_trader = SignalTrader(paper_engine, quant.store, gate_provider=lab_gate,
+                                 enabled=_env_on("JARVIS_PAPER_SIGNALS", False),
+                                 stake=f("JARVIS_PAPER_SIGNAL_STAKE", 20.0))
     if hasattr(poly, "observers"):
         poly.observers.append(paper_engine.tick)          # fills and exits first,
-        poly.observers.append(paper_source.on_run)        # then new resting orders
+        poly.observers.append(paper_source.on_run)        # then new resting orders,
+        poly.observers.append(signal_trader.on_run)       # then the gate-allowed signals
     state.set_component("paper", "READY")
 
 
@@ -379,6 +391,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# 13D: a write needs the shared secret (JARVIS_API_TOKEN). Reads are untouched, so the dashboard
+# keeps working. There is no localhost exemption: a browser sends loopback requests from any page.
+app.middleware("http")(require_token)
+
 app.mount(
     "/static",
     __import__("fastapi.staticfiles", fromlist=["StaticFiles"]).StaticFiles(
@@ -405,6 +421,7 @@ def trigger_state():
 def health():
     result = health_manager.check()
     result["live_execution"] = False
+    result["api_auth"] = auth_status()
     result["claude"] = bool(intelligence and intelligence.available)
     result["hermes"] = hermes.state.value if hermes else "UNAVAILABLE"
     return result
@@ -717,7 +734,8 @@ def paper_view(trades: int = 50):
                   "target_price": plans.get(p["position_id"], {}).get("target_price"),
                   "expires_at": plans.get(p["position_id"], {}).get("expires_at")} for p in paper_ledger.positions("OPEN")]
     return {**paper_engine.report(), "positions": open_rows, "trades": paper_engine.trades(max(1, min(int(trades), 500))),
-            "resting": paper_engine.resting("PENDING", 100),
+            "resting": paper_engine.resting("PENDING", 100), "settlement": paper_engine.settlement_report(),
+            "signal_trading": signal_trader.report(100) if signal_trader is not None else {"enabled": False},
             "forward_tests": [{**paper_source.standing(), "last_run": paper_source.last}] if paper_source is not None else []}
 
 
