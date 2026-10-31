@@ -98,8 +98,10 @@ def verdict(trades: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 class BollingerResting:
-    def __init__(self, engine: PaperEngine, store, enabled: bool = True, clock: Callable[[], datetime] | None = None):
+    def __init__(self, engine: PaperEngine, store, enabled: bool = True, executor: Any = None,
+                 clock: Callable[[], datetime] | None = None):
         self.engine, self.store, self.enabled = engine, store, bool(enabled)
+        self.executor = executor                   # 16B: may this trade open now, at this size?
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._seen: dict[str, int] = {}            # token -> the last completed hour it was evaluated at
         self.last: dict[str, Any] | None = None
@@ -199,7 +201,14 @@ class BollingerResting:
                 out["refused"] += 1
                 continue
             stop = min(STOP_MAX, STOP_BASE + max(0.0, ask - bid))
-            r = self.engine.rest(Order(NAME, m, buy["token_id"], STAKE, round(stop, 4), round(target, 4), MAX_HOLD_HOURS,
+            stake = STAKE
+            if self.executor is not None:
+                v = self.executor.may_open(NAME, STAKE)
+                if not v.allowed:
+                    out["refused"] += 1
+                    continue
+                stake = min(STAKE, v.max_stake)
+            r = self.engine.rest(Order(NAME, m, buy["token_id"], stake, round(stop, 4), round(target, 4), MAX_HOLD_HOURS,
                                        label=f"{first.get('question') or m} — {buy.get('outcome') or ''}".strip(" —")),
                                  bid, TTL_MINUTES)
             out["placed" if r["status"] == "RESTING" else "refused"] += 1
