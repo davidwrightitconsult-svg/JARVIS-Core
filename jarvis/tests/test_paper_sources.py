@@ -244,9 +244,11 @@ def test_the_gate_lists_forward_tests_but_they_cannot_approve_themselves(tmp_pat
 def test_app_runs_the_forward_test_after_each_scan(monkeypatch):
     from jarvis.app import main
     with TestClient(main.app) as c:
-        # exits and fills first, then the forward test, then the 13C gate-allowed signals
-        assert main.paper_source is not None and main.poly.observers[-3:] == [
-            main.paper_engine.tick, main.paper_source.on_run, main.signal_trader.on_run]
+        # exits and fills first, then the forward test, then the 13C gate-allowed signals, then
+        # the 15 arbitrage pairs. Fills and exits must run before anything opens a new position.
+        assert main.paper_source is not None and main.poly.observers[-4:] == [
+            main.paper_engine.tick, main.paper_source.on_run, main.signal_trader.on_run,
+            main.pair_trader.on_run]
         g = c.get("/api/lab/gate").json()
         assert NAME in g["forward_test"] and g["live_approved"] == []
         p = c.get("/api/paper").json()

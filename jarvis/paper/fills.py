@@ -110,6 +110,32 @@ def buy_for_stake(levels: Iterable[Any], stake: float, max_slippage: float | Non
                 levels_used=used, top_price=top, complete=spent >= stake - 1e-6)
 
 
+def buy_shares(levels: Iterable[Any], shares: float, max_slippage: float | None = None) -> Fill:
+    """Take asks until `shares` are held. Used where the quantity wanted is a share count rather
+    than a sum of money — an arbitrage pair needs the SAME number of shares on each leg, whatever
+    the two legs cost."""
+    book = _clean(levels)
+    if not book or not (isinstance(shares, (int, float)) and math.isfinite(shares) and shares > 0):
+        return EMPTY
+    top = book[0][0]
+    bought = spent = 0.0
+    used = 0
+    for price, size in book:
+        if not _limit_ok(price, top, max_slippage, buying=True):
+            break
+        room = shares - bought
+        if room <= 1e-9:
+            break
+        take = min(room, size)
+        bought += take
+        spent += take * price
+        used += 1
+    if bought <= 0:
+        return Fill(None, 0.0, 0.0, 0, top, False)
+    return Fill(price=round(spent / bought, 6), stake=round(spent, 6), shares=round(bought, 6),
+                levels_used=used, top_price=top, complete=bought >= shares - 1e-6)
+
+
 def sell_shares(levels: Iterable[Any], shares: float, max_slippage: float | None = None) -> Fill:
     """Sell up to `shares` into bids, best price first. Used for exits, where the quantity is
     shares already held rather than a sum of money."""
