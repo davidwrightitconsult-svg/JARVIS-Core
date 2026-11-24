@@ -113,21 +113,24 @@ def _momentum(m: MarketFeatures, o: TokenFeatures):
         "min_6h": MOMENTUM_MIN_6H, "min_1h": MOMENTUM_MIN_1H}
 
 
-LONGSHOT_MAX = 0.10
-FAVOURITE_MIN = 0.90
-
+LONGSHOT_MAX = 0.20
+FAVOURITE_MIN = 0.80
+MAX_SPREAD = 0.03  # Architect Patch: Refuse to trade if spread is wider than 3 cents
 
 def _longshot_bias(m: MarketFeatures, o: TokenFeatures):
     if o.mid is None:
         return None
+    # Architect Patch: Filter out wide spreads
+    if o.half_spread is not None and o.half_spread > MAX_SPREAD:
+        return None
+    
     if o.mid <= LONGSHOT_MAX:
         return "DOWN", _clip01((LONGSHOT_MAX - o.mid) / LONGSHOT_MAX + 0.1), {
-            "mid": o.mid, "band": f"<= {LONGSHOT_MAX}", "hours_to_end": m.hours_to_end}
+            "mid": o.mid, "band": f"<= {LONGSHOT_MAX}", "hours_to_end": m.hours_to_end, "spread": o.half_spread}
     if o.mid >= FAVOURITE_MIN:
         return "UP", _clip01((o.mid - FAVOURITE_MIN) / (1 - FAVOURITE_MIN) + 0.1), {
-            "mid": o.mid, "band": f">= {FAVOURITE_MIN}", "hours_to_end": m.hours_to_end}
+            "mid": o.mid, "band": f">= {FAVOURITE_MIN}", "hours_to_end": m.hours_to_end, "spread": o.half_spread}
     return None
-
 
 LIBRARY: tuple[Strategy, ...] = (
     Strategy("BOOK_IMBALANCE", "7B.1", 1.0,

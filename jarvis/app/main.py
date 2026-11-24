@@ -448,6 +448,11 @@ app.include_router(voice_tts_router)
 app.include_router(directives_router)
 app.include_router(brain_ws_router)
 
+@app.post("/api/signals/run")
+def run_signals_manually():
+    if signal_trader is None:
+        return {"error": "SignalTrader not initialized"}
+    return signal_trader.on_run()
 
 @app.get("/api/trigger/status")
 def trigger_state():

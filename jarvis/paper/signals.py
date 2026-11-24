@@ -155,11 +155,18 @@ class SignalTrader:
                     out["refused"] += 1
                     self._record(sig, token, "REFUSED", None, f"executor: {v.reason}")
                     continue
-                stake = min(self.stake, v.max_stake)
-            # No stop and no target: this is the bet the scorecard measured and the gate approved.
+            stake = min(self.stake, v.max_stake)
+            # Architect Patch: Smart exit for LONGSHOT_BIAS
+            target = None
+            if sig["strategy"] == "LONGSHOT_BIAS":
+                entry_price = sig.get("mid", 0.5)
+                if sig["direction"] == "UP":
+                    target = 0.95
+                else:
+                    target = entry_price * 2.0
             result = self.engine.submit(Order(
-                strategy=sig["strategy"], market_id=str(sig["market_id"]), token_id=token, stake=stake,
-                stop=NO_STOP, target=None, max_hold_hours=hold,
+            strategy=sig["strategy"], market_id=str(sig["market_id"]), token_id=token, stake=stake,
+                stop=NO_STOP, target=target, max_hold_hours=hold,
                 label=f"{sig['strategy']} {sig['direction']} · signal {sig['signal_id']}"))
             if result["status"] == "OPENED":
                 out["placed"] += 1

@@ -54,7 +54,7 @@ APPROVED, REDUCED, REJECTED = "APPROVED", "REDUCED", "REJECTED"
 @dataclass(frozen=True)
 class RiskSettings:
     bankroll: float = 1000.0             # PAPER bankroll (USD, notional) a fresh portfolio starts with
-    max_position_fraction: float = 0.02  # one position
+    max_position_fraction: float = 0.01  # one position
     max_market_fraction: float = 0.04    # everything held in one market
     max_strategy_fraction: float = 0.15  # everything one strategy holds
     max_total_exposure: float = 0.30     # everything at risk at once
